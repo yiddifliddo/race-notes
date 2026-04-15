@@ -6901,4 +6901,215 @@
         }
     });
 
+    // ========================================================================
+    // PIT STRATEGY CALCULATOR + FUEL AI CHAT
+    // ========================================================================
+
+    var fuelChatHistory = [];
+
+    // Populate session dropdown when Pit Strategy tab is shown for the first time
+    var pitSessionsLoaded = false;
+    $(document).on('click', '.apex-fuel-tab[data-fuel-tab="pit-strategy"]', function() {
+        if (!pitSessionsLoaded) {
+            loadPitSessions();
+            pitSessionsLoaded = true;
+        }
+    });
+
+    function loadPitSessions() {
+        if (!apexNotesData.isLoggedIn) {
+            $('#apex-pit-session').html('<option value="">Sign in to use your sessions</option>');
+            return;
+        }
+        $.ajax({
+            url: apexNotesData.ajaxUrl,
+            type: 'POST',
+            data: {
+                action: 'apex_notes_get_fuel_sessions',
+                nonce: apexNotesData.nonce,
+                limit: 25
+            },
+            success: function(response) {
+                var $sel = $('#apex-pit-session');
+                $sel.empty();
+                $sel.append('<option value="">— No session (manual entry) —</option>');
+                if (response.success && response.data.sessions && response.data.sessions.length) {
+                    response.data.sessions.forEach(function(s) {
+                        var label = s.track_venue + ' • ' + s.car_type +
+                            ' (' + (s.avg_fuel_liters ? parseFloat(s.avg_fuel_liters).toFixed(2) + 'L/lap' : 'no fuel data') + ')';
+                        $sel.append('<option value="' + s.id + '">' + escapeHtml(label) + '</option>');
+                    });
+                } else {
+                    $sel.append('<option value="">No sessions yet — upload one for best results</option>');
+                }
+            }
+        });
+    }
+
+    $(document).on('click', '#apex-pit-calc-run', function() {
+        var $btn = $(this);
+        var $result = $('#apex-pit-calc-result');
+
+        var payload = {
+            action: 'apex_notes_calculate_pit_strategy',
+            nonce: apexNotesData.nonce,
+            session_id: $('#apex-pit-session').val() || 0,
+            race_laps: $('#apex-pit-race-laps').val() || 0,
+            race_minutes: $('#apex-pit-race-minutes').val() || 0,
+            reserve_liters: $('#apex-pit-reserve').val() || 0.5,
+            avg_fuel_per_lap: $('#apex-pit-avg-fuel').val() || 0,
+            tank_capacity: $('#apex-pit-tank').val() || 0
+        };
+
+        $btn.prop('disabled', true).text('Calculating…');
+        $result.hide().empty();
+
+        $.ajax({
+            url: apexNotesData.ajaxUrl,
+            type: 'POST',
+            data: payload,
+            success: function(response) {
+                $btn.prop('disabled', false).text('Calculate Pit Plan');
+                if (response.success) {
+                    renderPitPlan(response.data);
+                } else {
+                    $result.show().html('<p class="apex-pit-calc-error">' + escapeHtml(response.data.message || 'Calculation failed') + '</p>');
+                }
+            },
+            error: function() {
+                $btn.prop('disabled', false).text('Calculate Pit Plan');
+                $result.show().html('<p class="apex-pit-calc-error">Network error — try again.</p>');
+            }
+        });
+    });
+
+    function renderPitPlan(data) {
+        var $result = $('#apex-pit-calc-result');
+        var inp = data.inputs;
+        var plan = data.plan;
+
+        var rows = plan.stints.map(function(s) {
+            return '<tr>' +
+                '<td>' + s.stint + '</td>' +
+                '<td>' + s.start_lap + '–' + s.end_lap + ' (' + s.laps + ' laps)</td>' +
+                '<td>' + (s.pit_in_lap !== null ? 'Pit after lap ' + s.pit_in_lap : '—') + '</td>' +
+                '<td>' + s.fuel_needed_liters.toFixed(2) + ' L</td>' +
+                '</tr>';
+        }).join('');
+
+        var evenSplit = plan.even_split_pit_laps && plan.even_split_pit_laps.length
+            ? '<p class="apex-pit-even-split">Even-split suggestion (minimises fuel carried): pit on laps <strong>' +
+              plan.even_split_pit_laps.join(', ') + '</strong>.</p>'
+            : '';
+
+        var html =
+            '<div class="apex-pit-calc-summary">' +
+                '<div><span>Laps per tank</span><strong>' + plan.laps_per_tank + '</strong></div>' +
+                '<div><span>Pit stops</span><strong>' + plan.num_pitstops + '</strong></div>' +
+                '<div><span>Min possible stops</span><strong>' + plan.min_possible_pitstops + '</strong></div>' +
+                '<div><span>Total fuel used</span><strong>' + plan.total_fuel_used_liters.toFixed(2) + ' L</strong></div>' +
+                (plan.estimated_race_time_formatted ? '<div><span>Est. race time</span><strong>' + plan.estimated_race_time_formatted + '</strong></div>' : '') +
+            '</div>' +
+            '<p class="apex-pit-calc-inputs">Source: <strong>' + inp.source + '</strong> • ' +
+                inp.tank_capacity + ' L tank • ' + inp.avg_fuel_per_lap.toFixed(3) + ' L/lap' +
+                (inp.avg_lap_time_formatted ? ' • avg ' + inp.avg_lap_time_formatted : '') +
+                ' • reserve ' + inp.reserve_liters + ' L' +
+                (inp.fuel_mult !== 1 ? ' • ' + inp.fuel_mult + 'x fuel mult' : '') +
+            '</p>' +
+            evenSplit +
+            '<table class="apex-pit-calc-table">' +
+                '<thead><tr><th>Stint</th><th>Laps</th><th>Pit lap</th><th>Fuel load</th></tr></thead>' +
+                '<tbody>' + rows + '</tbody>' +
+            '</table>' +
+            '<div class="apex-pit-calc-followup">' +
+                '<button class="apex-btn apex-btn-ghost" id="apex-pit-ask-ai">Ask AI to refine this plan</button>' +
+            '</div>';
+
+        $result.show().html(html);
+    }
+
+    $(document).on('click', '#apex-pit-ask-ai', function() {
+        var sessionId = $('#apex-pit-session').val() || 0;
+        var laps = $('#apex-pit-race-laps').val();
+        var mins = $('#apex-pit-race-minutes').val();
+        var q = 'Given my session data, suggest the best pit laps for a race of ';
+        if (laps) q += laps + ' laps'; else if (mins) q += mins + ' minutes'; else q += 'this length';
+        q += '. Explain your reasoning briefly and consider fuel saving vs. pace.';
+        $('#apex-fuel-ai-input').val(q).focus();
+        $('html, body').animate({ scrollTop: $('#apex-fuel-ai-input').offset().top - 100 }, 300);
+    });
+
+    // AI Chat
+    $(document).on('click', '#apex-fuel-ai-send', sendFuelAIMessage);
+    $(document).on('keydown', '#apex-fuel-ai-input', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendFuelAIMessage();
+        }
+    });
+    $(document).on('click', '.apex-fuel-ai-suggestion', function() {
+        $('#apex-fuel-ai-input').val($(this).data('query'));
+        sendFuelAIMessage();
+    });
+
+    function sendFuelAIMessage() {
+        var $input = $('#apex-fuel-ai-input');
+        var $send = $('#apex-fuel-ai-send');
+        var $messages = $('#apex-fuel-ai-messages');
+        var message = ($input.val() || '').trim();
+
+        if (!message) return;
+
+        // Remove the empty-state hints on first message
+        $messages.find('.apex-fuel-ai-empty').remove();
+
+        appendFuelChatMessage(message, 'user');
+        fuelChatHistory.push({ role: 'user', content: message });
+
+        $input.val('').prop('disabled', true);
+        $send.prop('disabled', true);
+
+        var $typing = $('<div class="apex-fuel-ai-msg assistant typing"><em>ApexFuelBot is thinking…</em></div>');
+        $messages.append($typing);
+        $messages.scrollTop($messages[0].scrollHeight);
+
+        $.ajax({
+            url: apexNotesData.ajaxUrl,
+            type: 'POST',
+            data: {
+                action: 'apex_notes_ai_fuel_chat',
+                nonce: apexNotesData.nonce,
+                message: message,
+                session_id: $('#apex-pit-session').val() || 0,
+                history: JSON.stringify(fuelChatHistory.slice(-6))
+            },
+            success: function(response) {
+                $typing.remove();
+                if (response.success) {
+                    var reply = response.data.reply || '(no response)';
+                    appendFuelChatMessage(reply, 'assistant');
+                    fuelChatHistory.push({ role: 'assistant', content: reply });
+                } else {
+                    appendFuelChatMessage((response.data && response.data.message) ? response.data.message : 'AI request failed.', 'assistant error');
+                }
+                $input.prop('disabled', false).focus();
+                $send.prop('disabled', false);
+            },
+            error: function() {
+                $typing.remove();
+                appendFuelChatMessage('Network error — please retry.', 'assistant error');
+                $input.prop('disabled', false).focus();
+                $send.prop('disabled', false);
+            }
+        });
+    }
+
+    function appendFuelChatMessage(text, role) {
+        var $messages = $('#apex-fuel-ai-messages');
+        var content = (role === 'user') ? escapeHtml(text) : formatAIResponse(text);
+        var classes = 'apex-fuel-ai-msg ' + role;
+        $messages.append('<div class="' + classes + '">' + content + '</div>');
+        $messages.scrollTop($messages[0].scrollHeight);
+    }
+
 })(jQuery);

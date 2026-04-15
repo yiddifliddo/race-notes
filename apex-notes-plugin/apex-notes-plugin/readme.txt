@@ -83,6 +83,19 @@ Users can upload their LMU session XML files (found in Documents\My Games\Le Man
 
 == Changelog ==
 
+= 1.19.0 =
+* NEW: Pit-Stop Calculator — work out optimal pit laps from your uploaded session data, supporting both lap-count and time-based races. Plans stints, fuel loads per stint, and suggests an even-split pit schedule to minimise fuel carried.
+* NEW: ApexFuelBot AI chat (Anthropic Claude) — ask questions about your fuel data, stint strategy, and pace. Uses your recent uploaded sessions plus community medians as context. Rate-limited to 30 questions/day per user.
+* NEW: Community averages now bucketed by fuel multiplier (1x / 2x / etc.) so mixed-multiplier sessions no longer contaminate each other.
+* NEW: Median + IQR-trimmed means replace raw averages for community fuel figures — a single bad lap no longer skews the bucket.
+* Fixed: XML parser now handles multiplayer/online race XMLs where Driver elements are nested inside RaceResults->Race (same fix as the Stewards Room got in 1.18.3).
+* Fixed: More LMU session types now parsed — Race1/Race2, Qualifying1-3, Practice1-4, TestDay, WarmUp — and unknown session-type elements are tolerated.
+* Fixed: Solo/hotlap XMLs with a single driver and no isPlayer flag now parse correctly.
+* Improved: Pit out-lap (the lap after a pit stop) is now excluded from fuel averages — no more noisy data from cold-tyre laps.
+* Improved: "No fuel burn recorded" anomaly detection (tiny fuel-used values with normal lap times are now flagged invalid).
+* Improved: Uploads are no longer restricted to Race sessions — Practice, Qualifying, TestDay, and WarmUp all work. Community averages still require ≥3 valid laps per session.
+* Improved: Clearer error messages for unrecognised XMLs.
+
 = 1.18.4 =
 * Fixed: Driver names now correctly extracted from XML using xpath and fallback methods
 * Improved: Uses multiple methods to find driver name element (xpath, direct access, children iteration)

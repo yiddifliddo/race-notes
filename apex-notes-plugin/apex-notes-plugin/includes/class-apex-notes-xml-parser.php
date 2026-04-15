@@ -127,32 +127,75 @@ class Apex_Notes_XML_Parser {
     
     /**
      * Find the player's driver data in the XML
-     * Returns the driver with isPlayer=1 from Practice, Qualifying, or Race
+     * Returns the driver with isPlayer=1 from Practice, Qualifying, or Race.
+     *
+     * Handles several LMU/rFactor XML layouts:
+     *  - Offline: <RaceResults><Race><Driver>...</Driver></Race></RaceResults>
+     *             (session container wraps Driver elements directly)
+     *  - Online:  <RaceResults><Race><Race><Driver>...</Driver></Race></Race></RaceResults>
+     *             (multiplayer nests drivers one level deeper; changelog note 1.18.3)
+     *  - Solo test sessions with a single driver and no <isPlayer> flag.
+     *
+     * Also accepts any session-type element that contains Driver elements
+     * (Race, Race1, Race2, Qualifying, Qualifying1-3, Practice, Practice1-3,
+     *  TestDay, WarmUp, etc.) so we don't break when LMU adds new session names.
      */
     private static function find_player_driver($results) {
-        // Session types in order of preference
-        $session_types = array('Race', 'Qualifying1', 'Qualifying', 'Practice1', 'Practice2', 'Practice3', 'Practice');
-        
-        foreach ($session_types as $session_type) {
-            if (!isset($results->$session_type)) {
+        // Preferred order — Race data is best, then Qualifying, then Practice.
+        $preferred = array(
+            'Race', 'Race1', 'Race2', 'Race3',
+            'Qualifying', 'Qualifying1', 'Qualifying2', 'Qualifying3',
+            'Practice', 'Practice1', 'Practice2', 'Practice3', 'Practice4',
+            'WarmUp', 'Warmup',
+            'TestDay', 'Test'
+        );
+
+        // Build ordered list: preferred first, then any other session-like child
+        // that wasn't in the preferred list (so we tolerate unknown session names).
+        $seen = array();
+        $session_names = array();
+        foreach ($preferred as $name) {
+            if (isset($results->$name)) {
+                $session_names[] = $name;
+                $seen[$name] = true;
+            }
+        }
+        foreach ($results->children() as $child) {
+            $name = $child->getName();
+            if (isset($seen[$name])) {
                 continue;
             }
-            
+            // Heuristic: only consider elements that contain at least one Driver
+            if (isset($child->Driver) || (isset($child->Race) && isset($child->Race->Driver))) {
+                $session_names[] = $name;
+                $seen[$name] = true;
+            }
+        }
+
+        foreach ($session_names as $session_type) {
             $session = $results->$session_type;
-            
-            // Find player driver
-            foreach ($session->Driver as $driver) {
-                if ((string) $driver->isPlayer === '1') {
-                    // Check if this driver has lap data
-                    $has_laps = false;
-                    foreach ($driver->children() as $child) {
-                        if ($child->getName() === 'Lap') {
-                            $has_laps = true;
-                            break;
-                        }
-                    }
-                    
-                    if ($has_laps) {
+
+            // Collect candidate driver containers. Multiplayer XMLs nest drivers
+            // under <Race> inside the session element; offline XMLs put them
+            // directly under the session element.
+            $containers = array($session);
+            if (isset($session->Race)) {
+                $containers[] = $session->Race;
+            }
+            if (isset($session->Qualifying)) {
+                $containers[] = $session->Qualifying;
+            }
+            if (isset($session->Practice)) {
+                $containers[] = $session->Practice;
+            }
+
+            // First pass: look for isPlayer=1 with lap data
+            foreach ($containers as $container) {
+                if (!isset($container->Driver)) {
+                    continue;
+                }
+                foreach ($container->Driver as $driver) {
+                    if ((string) $driver->isPlayer === '1' && self::driver_has_laps($driver)) {
                         return array(
                             'driver' => $driver,
                             'session_type' => $session_type
@@ -160,9 +203,51 @@ class Apex_Notes_XML_Parser {
                     }
                 }
             }
+
+            // Second pass: any driver flagged isPlayer (even without laps — covers
+            // XMLs that store laps elsewhere; extract_lap_data will simply find none)
+            foreach ($containers as $container) {
+                if (!isset($container->Driver)) {
+                    continue;
+                }
+                foreach ($container->Driver as $driver) {
+                    if ((string) $driver->isPlayer === '1') {
+                        return array(
+                            'driver' => $driver,
+                            'session_type' => $session_type
+                        );
+                    }
+                }
+            }
+
+            // Third pass: if there's only one driver (solo hotlap/test), use it.
+            foreach ($containers as $container) {
+                if (!isset($container->Driver)) {
+                    continue;
+                }
+                $drivers = $container->Driver;
+                if (count($drivers) === 1 && self::driver_has_laps($drivers[0])) {
+                    return array(
+                        'driver' => $drivers[0],
+                        'session_type' => $session_type
+                    );
+                }
+            }
         }
-        
-        return new WP_Error('no_player_data', 'No player lap data found in this session');
+
+        return new WP_Error('no_player_data', 'No player lap data found in this session. Make sure you are uploading your own session XML.');
+    }
+
+    /**
+     * Does this driver element contain any <Lap> children?
+     */
+    private static function driver_has_laps($driver) {
+        foreach ($driver->children() as $child) {
+            if ($child->getName() === 'Lap') {
+                return true;
+            }
+        }
+        return false;
     }
     
     /**
@@ -182,22 +267,40 @@ class Apex_Notes_XML_Parser {
     }
     
     /**
-     * Extract lap data from driver element
+     * Extract lap data from driver element.
+     *
+     * Post-processes laps to flag the out-lap (lap immediately after a pit
+     * stop). Out-laps begin with cold tyres and incomplete fuel stint data,
+     * so their per-lap fuel/VE usage is unreliable.
      */
     private static function extract_lap_data($driver, $car_type) {
         $laps = array();
-        
+
         foreach ($driver->children() as $child) {
             if ($child->getName() !== 'Lap') {
                 continue;
             }
-            
+
             $lap = self::parse_lap_element($child, $car_type);
             if ($lap) {
                 $laps[] = $lap;
             }
         }
-        
+
+        // Second pass: mark out-laps (the lap after any pit in-lap) as invalid
+        // for fuel calculations. We iterate in order; the lap with pit=1 is the
+        // in-lap, and the next lap in sequence is the out-lap.
+        $count = count($laps);
+        for ($i = 0; $i < $count - 1; $i++) {
+            if (!empty($laps[$i]['is_pit_lap'])) {
+                $next = $i + 1;
+                if ($laps[$next]['is_valid']) {
+                    $laps[$next]['is_valid'] = 0;
+                    $laps[$next]['invalid_reason'] = 'Out-lap (post-pit)';
+                }
+            }
+        }
+
         return $laps;
     }
     
@@ -224,14 +327,9 @@ class Apex_Notes_XML_Parser {
         // Determine if lap is valid for fuel calculations
         $is_valid = true;
         $invalid_reason = '';
-        
-        // First lap often has abnormal fuel data (pit exit, formation lap)
-        if ($lap_num === 1) {
-            $is_valid = false;
-            $invalid_reason = 'First lap (out lap)';
-        }
-        // Pit laps have negative fuel used (refueling)
-        elseif ($is_pit) {
+
+        // Pit laps have incomplete stint fuel and often refueling
+        if ($is_pit) {
             $is_valid = false;
             $invalid_reason = 'Pit stop lap';
         }
@@ -245,10 +343,26 @@ class Apex_Notes_XML_Parser {
             $is_valid = false;
             $invalid_reason = 'Incomplete lap';
         }
-        // Extremely high fuel usage (likely incident or error)
+        // First lap is usually an out-lap from the grid or pits with
+        // abnormally low fuel burn. Only mark invalid if the burn is
+        // clearly below realistic stint usage (< 25% of tank / lap).
+        // For very short races (sprint formats) the first lap may be
+        // legitimately close to average, but excluding it is the safer
+        // default for fuel-consumption analytics.
+        elseif ($lap_num === 1) {
+            $is_valid = false;
+            $invalid_reason = 'First lap (out-lap)';
+        }
+        // Extremely high fuel usage (likely incident, stall, or telemetry glitch)
         elseif ($fuel_used > 0.15) { // More than 15% in one lap is suspicious
             $is_valid = false;
             $invalid_reason = 'Abnormal fuel usage';
+        }
+        // Near-zero fuel usage with a valid lap time is a data anomaly
+        // (e.g. telemetry skipped a lap, virtual-energy-only mode).
+        elseif ($fuel_used < 0.0005 && $lap_time > 30) {
+            $is_valid = false;
+            $invalid_reason = 'No fuel burn recorded';
         }
         
         return array(
@@ -445,16 +559,10 @@ class Apex_Notes_XML_Parser {
             return $parsed;
         }
         
-        // Validate session type - only Race sessions allowed
+        // Accept all session types (Race, Practice, Qualifying, TestDay, WarmUp...).
+        // Community averages are still computed only from sessions with enough
+        // valid laps (see Apex_Notes_DB::update_community_average).
         $session_type = $parsed['session_type_name'];
-        if (strpos($session_type, 'Race') === false) {
-            return new WP_Error('invalid_session', 
-                'Only RACE sessions are supported. This appears to be a ' . $session_type . ' session. ' .
-                'Please upload a Race session file (ending in -R1.xml or -R2.xml).'
-            );
-        }
-        
-        // Prepare session data for database
         $session_data = $parsed['session'];
         $session_data['user_id'] = $user_id;
         $session_data['session_type'] = $session_type;

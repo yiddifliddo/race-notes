@@ -84,6 +84,10 @@ class Apex_Notes_Ajax {
         add_action('wp_ajax_nopriv_apex_notes_get_community_fuel_data', array($this, 'get_community_fuel_data'));
         add_action('wp_ajax_apex_notes_get_car_specs', array($this, 'get_car_specs'));
         add_action('wp_ajax_nopriv_apex_notes_get_car_specs', array($this, 'get_car_specs'));
+
+        // Pit strategy calculator + AI fuel chat
+        add_action('wp_ajax_apex_notes_calculate_pit_strategy', array($this, 'calculate_pit_strategy'));
+        add_action('wp_ajax_apex_notes_ai_fuel_chat', array($this, 'ai_fuel_chat'));
         
         // Tire Data AJAX actions
         add_action('wp_ajax_apex_notes_get_tire_tracks', array($this, 'get_tire_tracks'));
@@ -2433,12 +2437,470 @@ CRITICAL RULES:
      */
     public function get_car_specs() {
         $car_type = isset($_POST['car_type']) ? sanitize_text_field($_POST['car_type']) : null;
-        
+
         $specs = Apex_Notes_DB::get_car_specs($car_type);
-        
+
         wp_send_json_success(array('specs' => $specs));
     }
-    
+
+    // ========================================
+    // PIT STRATEGY CALCULATOR + AI FUEL CHAT
+    // ========================================
+
+    /**
+     * Deterministic pit-stop strategy calculator.
+     *
+     * Inputs (POST):
+     *   session_id      (int)    - user's fuel session to base numbers on (optional if explicit params supplied)
+     *   race_laps       (int)    - total race length in laps (provide this OR race_minutes)
+     *   race_minutes    (float)  - total race length in minutes
+     *   tank_capacity   (float)  - litres; falls back to car spec
+     *   avg_fuel_per_lap (float) - litres/lap; falls back to session avg or community median
+     *   avg_lap_time    (float)  - seconds; used to convert minutes→laps
+     *   reserve_liters  (float)  - safety margin kept in the tank (default 0.5L)
+     *   start_fuel_liters (float)- optional starting fuel (default = full tank)
+     *
+     * Output: stint plan with pit lap numbers and fuel loads.
+     */
+    public function calculate_pit_strategy() {
+        $this->verify_nonce();
+
+        $session_id = isset($_POST['session_id']) ? intval($_POST['session_id']) : 0;
+        $session = $session_id ? Apex_Notes_DB::get_fuel_session($session_id) : null;
+
+        // Resolve parameters with session/community/defaults as fallbacks
+        $tank_capacity = isset($_POST['tank_capacity']) ? floatval($_POST['tank_capacity']) : 0;
+        $avg_fuel = isset($_POST['avg_fuel_per_lap']) ? floatval($_POST['avg_fuel_per_lap']) : 0;
+        $avg_lap_time = isset($_POST['avg_lap_time']) ? floatval($_POST['avg_lap_time']) : 0;
+        $race_laps = isset($_POST['race_laps']) ? intval($_POST['race_laps']) : 0;
+        $race_minutes = isset($_POST['race_minutes']) ? floatval($_POST['race_minutes']) : 0;
+        $reserve_liters = isset($_POST['reserve_liters']) ? max(0.0, floatval($_POST['reserve_liters'])) : 0.5;
+        $start_fuel = isset($_POST['start_fuel_liters']) ? floatval($_POST['start_fuel_liters']) : 0;
+        $fuel_mult = isset($_POST['fuel_mult']) ? floatval($_POST['fuel_mult']) : 0;
+        $track_venue = isset($_POST['track_venue']) ? sanitize_text_field($_POST['track_venue']) : '';
+        $car_type = isset($_POST['car_type']) ? sanitize_text_field($_POST['car_type']) : '';
+
+        if ($session) {
+            if (!$tank_capacity) {
+                $tank_capacity = floatval(Apex_Notes_DB::get_tank_capacity($session['car_type']));
+            }
+            if (!$avg_fuel && !empty($session['avg_fuel_liters'])) {
+                $avg_fuel = floatval($session['avg_fuel_liters']);
+            }
+            if (!$avg_lap_time && !empty($session['avg_lap_time'])) {
+                $avg_lap_time = floatval($session['avg_lap_time']);
+            }
+            if (!$fuel_mult && !empty($session['fuel_mult'])) {
+                $fuel_mult = floatval($session['fuel_mult']);
+            }
+            if (!$track_venue) {
+                $track_venue = $session['track_venue'];
+            }
+            if (!$car_type) {
+                $car_type = $session['car_type'];
+            }
+        }
+
+        // Community fallback for avg_fuel if user hasn't uploaded a session
+        if (!$avg_fuel && $track_venue && $car_type) {
+            $bucket = Apex_Notes_DB::get_community_fuel_average($track_venue, $car_type, $fuel_mult ?: 1.0);
+            if ($bucket && !empty($bucket['median_fuel_liters'])) {
+                $avg_fuel = floatval($bucket['median_fuel_liters']);
+                if (!$avg_lap_time && !empty($bucket['avg_lap_time'])) {
+                    $avg_lap_time = floatval($bucket['avg_lap_time']);
+                }
+            }
+        }
+
+        if (!$tank_capacity && $car_type) {
+            $tank_capacity = floatval(Apex_Notes_DB::get_tank_capacity($car_type)) ?: 100.0;
+        }
+
+        // Validate
+        if ($tank_capacity <= 0 || $avg_fuel <= 0) {
+            wp_send_json_error(array('message' => 'Need a tank capacity and an average fuel-per-lap figure. Upload a session or pick a track+car with community data.'));
+            return;
+        }
+        if ($race_laps <= 0 && $race_minutes <= 0) {
+            wp_send_json_error(array('message' => 'Specify the race length in laps or minutes.'));
+            return;
+        }
+        if ($race_minutes > 0 && $avg_lap_time <= 0) {
+            wp_send_json_error(array('message' => 'Average lap time required to plan a timed race.'));
+            return;
+        }
+
+        // Convert timed race to laps (round up so we plan enough fuel to finish)
+        if ($race_laps <= 0) {
+            $race_laps = (int) ceil(($race_minutes * 60.0) / $avg_lap_time);
+        }
+
+        if ($start_fuel <= 0 || $start_fuel > $tank_capacity) {
+            $start_fuel = $tank_capacity;
+        }
+
+        $usable_tank = max(0.0, $tank_capacity - $reserve_liters);
+        $laps_per_tank = (int) floor($usable_tank / $avg_fuel);
+        if ($laps_per_tank < 1) {
+            wp_send_json_error(array('message' => 'Tank capacity cannot cover a single lap at this fuel burn.'));
+            return;
+        }
+
+        // Stint planning: first stint constrained by start_fuel, subsequent by full tank.
+        $laps_first_stint = (int) floor(max(0.0, $start_fuel - $reserve_liters) / $avg_fuel);
+        $laps_first_stint = max(0, min($laps_first_stint, $race_laps));
+        $total_laps = $race_laps;
+
+        $stints = array();
+        $remaining = $total_laps;
+        $pit_laps = array();
+        $cumulative_lap = 0;
+
+        if ($laps_first_stint >= $remaining) {
+            // No pit stops needed
+            $stints[] = array(
+                'stint' => 1,
+                'laps' => $remaining,
+                'start_lap' => 1,
+                'end_lap' => $remaining,
+                'fuel_needed_liters' => round($remaining * $avg_fuel + $reserve_liters, 2),
+                'pit_in_lap' => null,
+            );
+        } else {
+            // First stint
+            $stints[] = array(
+                'stint' => 1,
+                'laps' => $laps_first_stint,
+                'start_lap' => 1,
+                'end_lap' => $laps_first_stint,
+                'fuel_needed_liters' => round($laps_first_stint * $avg_fuel + $reserve_liters, 2),
+                'pit_in_lap' => $laps_first_stint,
+            );
+            $pit_laps[] = $laps_first_stint;
+            $cumulative_lap = $laps_first_stint;
+            $remaining -= $laps_first_stint;
+
+            // Subsequent stints
+            $stint_num = 2;
+            while ($remaining > 0) {
+                $this_stint = min($laps_per_tank, $remaining);
+                $start = $cumulative_lap + 1;
+                $end = $cumulative_lap + $this_stint;
+                $fuel_needed = round($this_stint * $avg_fuel + $reserve_liters, 2);
+                $stints[] = array(
+                    'stint' => $stint_num,
+                    'laps' => $this_stint,
+                    'start_lap' => $start,
+                    'end_lap' => $end,
+                    'fuel_needed_liters' => $fuel_needed,
+                    'pit_in_lap' => ($remaining - $this_stint > 0) ? $end : null,
+                );
+                if ($remaining - $this_stint > 0) {
+                    $pit_laps[] = $end;
+                }
+                $cumulative_lap = $end;
+                $remaining -= $this_stint;
+                $stint_num++;
+            }
+        }
+
+        $num_pitstops = count($pit_laps);
+
+        // Even-split alternative: distribute pit stops evenly to minimise fuel carried.
+        // Number of pit stops needed at minimum is ceil(total_laps / laps_per_tank) - 1
+        // when starting with a full tank.
+        $min_stops = max(0, (int) ceil($total_laps / $laps_per_tank) - 1);
+        $even_pit_laps = array();
+        if ($min_stops > 0) {
+            $stints_count = $min_stops + 1;
+            $base_laps = intdiv($total_laps, $stints_count);
+            $extra = $total_laps - ($base_laps * $stints_count);
+            $lap = 0;
+            for ($i = 0; $i < $min_stops; $i++) {
+                $lap += $base_laps + ($i < $extra ? 1 : 0);
+                $even_pit_laps[] = $lap;
+            }
+        }
+
+        $total_fuel_used = round($total_laps * $avg_fuel, 2);
+        $est_race_time_s = $total_laps * $avg_lap_time;
+
+        wp_send_json_success(array(
+            'inputs' => array(
+                'tank_capacity' => round($tank_capacity, 2),
+                'avg_fuel_per_lap' => round($avg_fuel, 3),
+                'avg_lap_time' => $avg_lap_time ? round($avg_lap_time, 3) : null,
+                'avg_lap_time_formatted' => $avg_lap_time ? Apex_Notes_XML_Parser::format_lap_time($avg_lap_time) : null,
+                'race_laps' => $race_laps,
+                'race_minutes_input' => $race_minutes ?: null,
+                'reserve_liters' => round($reserve_liters, 2),
+                'start_fuel_liters' => round($start_fuel, 2),
+                'fuel_mult' => $fuel_mult ?: 1.0,
+                'track_venue' => $track_venue,
+                'car_type' => $car_type,
+                'source' => $session ? 'session' : ($track_venue && $car_type ? 'community' : 'manual'),
+            ),
+            'plan' => array(
+                'laps_per_tank' => $laps_per_tank,
+                'num_pitstops' => $num_pitstops,
+                'min_possible_pitstops' => $min_stops,
+                'pit_laps' => $pit_laps,
+                'even_split_pit_laps' => $even_pit_laps,
+                'total_fuel_used_liters' => $total_fuel_used,
+                'estimated_race_time_s' => $est_race_time_s ?: null,
+                'estimated_race_time_formatted' => $est_race_time_s ? self::format_duration_h($est_race_time_s) : null,
+                'stints' => $stints,
+            ),
+        ));
+    }
+
+    /**
+     * Human-readable H:MM:SS duration.
+     */
+    private static function format_duration_h($seconds) {
+        $seconds = max(0, (int) round($seconds));
+        $h = intdiv($seconds, 3600);
+        $m = intdiv($seconds % 3600, 60);
+        $s = $seconds % 60;
+        return sprintf('%d:%02d:%02d', $h, $m, $s);
+    }
+
+    /**
+     * AI fuel chat — answers questions about a user's uploaded fuel data
+     * and suggests pit strategies.
+     *
+     * Uses Anthropic Messages API. Employs prompt caching on the large,
+     * stable system prompt so repeated questions are cheaper.
+     *
+     * POST:
+     *   session_id  (int, optional)  - focus the AI on this session
+     *   message     (string)         - the user's question
+     *   history     (JSON array)     - recent turns [{role, content}, ...]
+     */
+    public function ai_fuel_chat() {
+        $this->verify_nonce();
+
+        if (!is_user_logged_in()) {
+            wp_send_json_error(array('message' => 'You must be logged in to use AI chat.'));
+            return;
+        }
+
+        $user_id = get_current_user_id();
+        $message = isset($_POST['message']) ? sanitize_textarea_field($_POST['message']) : '';
+        $session_id = isset($_POST['session_id']) ? intval($_POST['session_id']) : 0;
+        $history = isset($_POST['history']) ? json_decode(stripslashes($_POST['history']), true) : array();
+
+        if (empty($message)) {
+            wp_send_json_error(array('message' => 'Please enter a question.'));
+            return;
+        }
+
+        // Rate limit — 30 AI messages per user per day
+        $rate_key = 'apex_notes_ai_fuel_rate_' . $user_id;
+        $today_count = intval(get_transient($rate_key));
+        if ($today_count >= 30) {
+            wp_send_json_error(array('message' => 'Daily AI chat limit reached. Try again tomorrow.'));
+            return;
+        }
+
+        $api_key = get_option('apex_notes_anthropic_api_key', '');
+        if (empty($api_key)) {
+            wp_send_json_error(array(
+                'message' => 'AI chat is not configured. An admin needs to add an Anthropic API key in Apex Notes > Settings.'
+            ));
+            return;
+        }
+
+        // Build structured context from the user's data
+        $context = $this->build_fuel_ai_context($user_id, $session_id);
+        $context_json = wp_json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        // Static system prompt — cacheable
+        $system_prompt = "You are ApexFuelBot, a pit-strategy and fuel-analytics assistant for the sim racing game Le Mans Ultimate.\n\n"
+            . "Your job is to analyse a driver's race XML data and answer questions about:\n"
+            . "- Optimal pit-stop laps given race length, tank size, and average fuel burn\n"
+            . "- Number of stints, fuel loads per stint, and fuel carried (weight vs. safety margin)\n"
+            . "- Virtual Energy (VE) usage for Hypercars and how it interacts with fuel strategy\n"
+            . "- Stint pace, lap-time consistency, and where time is being lost\n"
+            . "- Comparison of the driver's numbers to community medians (provided in context)\n\n"
+            . "CALCULATION RULES:\n"
+            . "- laps_per_tank = floor((tank_capacity - reserve_liters) / avg_fuel_per_lap)\n"
+            . "- min_pit_stops = ceil(race_laps / laps_per_tank) - 1 (if starting with a full tank)\n"
+            . "- When recommending pit laps, split the race evenly across stints to minimise fuel carried (lap-time gain).\n"
+            . "- Always keep a 0.3-1.0 L reserve unless the user asks for aggressive splash-and-dash.\n"
+            . "- If the data provided has fuel_mult > 1, the driver's avg_fuel_per_lap is already scaled; do not normalise unless asked.\n\n"
+            . "STYLE:\n"
+            . "- Be concrete and numeric. Round litres to 2 decimals, lap times to mm:ss.sss.\n"
+            . "- When suggesting pit laps, show a table: Stint | Laps | Pit lap | Fuel load.\n"
+            . "- Keep answers under 300 words unless more detail is requested.\n"
+            . "- If the user's question isn't about fuel, pit strategy, pace, or race data, politely redirect.\n"
+            . "- If data is missing (e.g. no sessions uploaded), tell them what to upload.";
+
+        // Build messages
+        $messages = array();
+        if (!empty($history) && is_array($history)) {
+            foreach (array_slice($history, -6) as $msg) {
+                if (isset($msg['role'], $msg['content']) && in_array($msg['role'], array('user', 'assistant'), true)) {
+                    $messages[] = array(
+                        'role' => $msg['role'],
+                        'content' => (string) $msg['content'],
+                    );
+                }
+            }
+        }
+
+        $user_content = "Data about my uploaded sessions (JSON):\n```json\n" . $context_json . "\n```\n\nQuestion: " . $message;
+        $messages[] = array('role' => 'user', 'content' => $user_content);
+
+        // Call Anthropic with a cache_control breakpoint on the system prompt
+        $body = array(
+            'model' => 'claude-haiku-4-5-20251001',
+            'max_tokens' => 1024,
+            'system' => array(
+                array(
+                    'type' => 'text',
+                    'text' => $system_prompt,
+                    'cache_control' => array('type' => 'ephemeral'),
+                ),
+            ),
+            'messages' => $messages,
+        );
+
+        $response = wp_remote_post('https://api.anthropic.com/v1/messages', array(
+            'headers' => array(
+                'Content-Type' => 'application/json',
+                'x-api-key' => $api_key,
+                'anthropic-version' => '2023-06-01',
+            ),
+            'body' => wp_json_encode($body),
+            'timeout' => 60,
+        ));
+
+        if (is_wp_error($response)) {
+            wp_send_json_error(array('message' => 'AI API error: ' . $response->get_error_message()));
+            return;
+        }
+
+        $status = wp_remote_retrieve_response_code($response);
+        $decoded = json_decode(wp_remote_retrieve_body($response), true);
+
+        if ($status !== 200 || !isset($decoded['content'])) {
+            $err = isset($decoded['error']['message']) ? $decoded['error']['message'] : 'Unknown error';
+            wp_send_json_error(array('message' => 'AI API returned ' . $status . ': ' . $err));
+            return;
+        }
+
+        $reply = '';
+        foreach ($decoded['content'] as $block) {
+            if (isset($block['type']) && $block['type'] === 'text') {
+                $reply .= $block['text'];
+            }
+        }
+
+        // Update rate limit (expires at end of day)
+        set_transient($rate_key, $today_count + 1, DAY_IN_SECONDS);
+
+        wp_send_json_success(array(
+            'reply' => $reply,
+            'usage' => isset($decoded['usage']) ? $decoded['usage'] : null,
+            'remaining_today' => max(0, 29 - $today_count),
+        ));
+    }
+
+    /**
+     * Assemble a compact JSON context about the user's fuel data for the AI.
+     * Includes the focused session (if any), recent sessions, and community
+     * medians for the relevant track+car buckets.
+     */
+    private function build_fuel_ai_context($user_id, $session_id = 0) {
+        $ctx = array(
+            'focused_session' => null,
+            'recent_sessions' => array(),
+            'community_context' => array(),
+        );
+
+        if ($session_id) {
+            $session = Apex_Notes_DB::get_fuel_session($session_id);
+            if ($session && intval($session['user_id']) === intval($user_id)) {
+                $laps = Apex_Notes_DB::get_fuel_session_laps($session_id);
+                $tank = Apex_Notes_DB::get_tank_capacity($session['car_type']);
+                $ctx['focused_session'] = array(
+                    'id' => intval($session['id']),
+                    'track' => $session['track_venue'],
+                    'car' => $session['car_type'],
+                    'car_class' => $session['car_class'],
+                    'session_type' => $session['session_type'],
+                    'fuel_mult' => floatval($session['fuel_mult']),
+                    'tank_capacity_l' => floatval($tank),
+                    'total_laps' => intval($session['total_laps']),
+                    'valid_laps' => intval($session['valid_laps']),
+                    'pitstops' => intval($session['pitstops']),
+                    'avg_fuel_liters' => $session['avg_fuel_liters'] !== null ? round(floatval($session['avg_fuel_liters']), 3) : null,
+                    'avg_ve_percent' => $session['avg_ve_percent'] !== null ? round(floatval($session['avg_ve_percent']) * 100, 2) : null,
+                    'avg_lap_time_s' => $session['avg_lap_time'] !== null ? round(floatval($session['avg_lap_time']), 3) : null,
+                    'best_lap_time_s' => $session['best_lap_time'] !== null ? round(floatval($session['best_lap_time']), 3) : null,
+                );
+
+                // Per-lap summary (trimmed list to keep prompt small)
+                $lap_summary = array();
+                $tank_val = floatval($tank) ?: 100.0;
+                foreach ($laps as $l) {
+                    $lap_summary[] = array(
+                        'n' => intval($l['lap_num']),
+                        'time' => $l['lap_time'] !== null ? round(floatval($l['lap_time']), 3) : null,
+                        'fuel_l' => $l['fuel_used'] !== null ? round(floatval($l['fuel_used']) * $tank_val, 3) : null,
+                        've_pct' => $l['ve_used'] !== null ? round(floatval($l['ve_used']) * 100, 2) : null,
+                        'pit' => intval($l['is_pit_lap']) ? 1 : 0,
+                        'valid' => intval($l['is_valid']) ? 1 : 0,
+                    );
+                }
+                // Cap to last 40 laps to stay compact
+                if (count($lap_summary) > 40) {
+                    $lap_summary = array_slice($lap_summary, -40);
+                }
+                $ctx['focused_session']['laps'] = $lap_summary;
+
+                // Pull community bucket(s) for same track+car
+                $buckets = Apex_Notes_DB::get_community_fuel_buckets($session['track_venue'], $session['car_type']);
+                foreach ($buckets as $b) {
+                    $ctx['community_context'][] = array(
+                        'track' => $b['track_venue'],
+                        'car' => $b['car_type'],
+                        'fuel_mult' => floatval($b['fuel_mult']),
+                        'sample_count' => intval($b['sample_count']),
+                        'lap_count' => intval($b['lap_count']),
+                        'median_fuel_l' => $b['median_fuel_liters'] !== null ? round(floatval($b['median_fuel_liters']), 3) : null,
+                        'avg_fuel_l' => $b['avg_fuel_liters'] !== null ? round(floatval($b['avg_fuel_liters']), 3) : null,
+                        'min_fuel_l' => $b['min_fuel_liters'] !== null ? round(floatval($b['min_fuel_liters']), 3) : null,
+                        'max_fuel_l' => $b['max_fuel_liters'] !== null ? round(floatval($b['max_fuel_liters']), 3) : null,
+                        'avg_lap_time_s' => $b['avg_lap_time'] !== null ? round(floatval($b['avg_lap_time']), 3) : null,
+                    );
+                }
+            }
+        }
+
+        // Always include the user's last few sessions as background
+        $recent = Apex_Notes_DB::get_user_fuel_sessions($user_id, 8);
+        if (is_array($recent)) {
+            foreach ($recent as $s) {
+                $ctx['recent_sessions'][] = array(
+                    'id' => intval($s['id']),
+                    'track' => $s['track_venue'],
+                    'car' => $s['car_type'],
+                    'class' => $s['car_class'],
+                    'session_type' => $s['session_type'],
+                    'fuel_mult' => floatval($s['fuel_mult']),
+                    'valid_laps' => intval($s['valid_laps']),
+                    'avg_fuel_l' => $s['avg_fuel_liters'] !== null ? round(floatval($s['avg_fuel_liters']), 3) : null,
+                    'avg_lap_time_s' => $s['avg_lap_time'] !== null ? round(floatval($s['avg_lap_time']), 3) : null,
+                    'best_lap_time_s' => $s['best_lap_time'] !== null ? round(floatval($s['best_lap_time']), 3) : null,
+                );
+            }
+        }
+
+        return $ctx;
+    }
+
     // ========================================
     // TIRE DATA HANDLERS
     // ========================================

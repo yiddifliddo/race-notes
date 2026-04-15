@@ -261,20 +261,26 @@ class Apex_Notes_DB {
             KEY is_valid (is_valid)
         ) $charset_collate;";
         
-        // Community fuel averages table (aggregated data by track+car)
+        // Community fuel averages table (aggregated data by track+car+fuel_mult).
+        // Previously keyed on (track_venue, car_type); as of v1.19 community
+        // averages are bucketed by fuel_mult so 1x/2x/etc. never mix.
+        // Median + IQR-trimmed mean are computed in PHP and stored here.
         $table_fuel_averages = $wpdb->prefix . 'apex_notes_fuel_averages';
         $sql_fuel_averages = "CREATE TABLE $table_fuel_averages (
             id bigint(20) NOT NULL AUTO_INCREMENT,
             track_venue varchar(200) NOT NULL,
             car_type varchar(100) NOT NULL,
             car_class varchar(50) NOT NULL,
+            fuel_mult decimal(3,2) NOT NULL DEFAULT 1.00,
             sample_count int(11) DEFAULT 0,
             lap_count int(11) DEFAULT 0,
-            avg_fuel_liters decimal(5,3) DEFAULT NULL,
-            min_fuel_liters decimal(5,3) DEFAULT NULL,
-            max_fuel_liters decimal(5,3) DEFAULT NULL,
-            std_dev_fuel decimal(5,3) DEFAULT NULL,
+            avg_fuel_liters decimal(6,3) DEFAULT NULL,
+            median_fuel_liters decimal(6,3) DEFAULT NULL,
+            min_fuel_liters decimal(6,3) DEFAULT NULL,
+            max_fuel_liters decimal(6,3) DEFAULT NULL,
+            std_dev_fuel decimal(6,3) DEFAULT NULL,
             avg_ve_percent decimal(6,4) DEFAULT NULL,
+            median_ve_percent decimal(6,4) DEFAULT NULL,
             min_ve_percent decimal(6,4) DEFAULT NULL,
             max_ve_percent decimal(6,4) DEFAULT NULL,
             avg_lap_time decimal(8,3) DEFAULT NULL,
@@ -282,7 +288,7 @@ class Apex_Notes_DB {
             fuel_mult_note varchar(20) DEFAULT '1x',
             last_updated datetime DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
-            UNIQUE KEY track_car (track_venue, car_type),
+            UNIQUE KEY track_car_mult (track_venue, car_type, fuel_mult),
             KEY car_class (car_class),
             KEY sample_count (sample_count)
         ) $charset_collate;";
@@ -442,6 +448,7 @@ class Apex_Notes_DB {
         dbDelta($sql_fuel_sessions);
         dbDelta($sql_fuel_laps);
         dbDelta($sql_fuel_averages);
+        self::migrate_fuel_averages_schema();
         dbDelta($sql_tire_averages);
         dbDelta($sql_live_broadcasts);
         dbDelta($sql_live_telemetry);
@@ -2046,14 +2053,50 @@ class Apex_Notes_DB {
     }
     
     /**
-     * Get community fuel averages for a track+car combination
+     * Get community fuel averages for a track+car combination.
+     *
+     * As of v1.19 averages are bucketed by fuel_mult. If $fuel_mult is given,
+     * returns that bucket. Otherwise prefers the 1x bucket; falls back to the
+     * bucket with the highest sample_count.
      */
-    public static function get_community_fuel_average($track_venue, $car_type) {
+    public static function get_community_fuel_average($track_venue, $car_type, $fuel_mult = null) {
         global $wpdb;
         $table = $wpdb->prefix . 'apex_notes_fuel_averages';
-        
+
+        if ($fuel_mult !== null) {
+            return $wpdb->get_row($wpdb->prepare(
+                "SELECT * FROM $table WHERE track_venue = %s AND car_type = %s AND fuel_mult = %f",
+                $track_venue,
+                $car_type,
+                floatval($fuel_mult)
+            ), ARRAY_A);
+        }
+
+        // Prefer 1x, then biggest sample
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT * FROM $table WHERE track_venue = %s AND car_type = %s AND fuel_mult = 1.00",
+            $track_venue,
+            $car_type
+        ), ARRAY_A);
+        if ($row) {
+            return $row;
+        }
         return $wpdb->get_row($wpdb->prepare(
-            "SELECT * FROM $table WHERE track_venue = %s AND car_type = %s",
+            "SELECT * FROM $table WHERE track_venue = %s AND car_type = %s ORDER BY sample_count DESC LIMIT 1",
+            $track_venue,
+            $car_type
+        ), ARRAY_A);
+    }
+
+    /**
+     * Get all community fuel average buckets (one per fuel_mult) for a track+car.
+     */
+    public static function get_community_fuel_buckets($track_venue, $car_type) {
+        global $wpdb;
+        $table = $wpdb->prefix . 'apex_notes_fuel_averages';
+
+        return $wpdb->get_results($wpdb->prepare(
+            "SELECT * FROM $table WHERE track_venue = %s AND car_type = %s ORDER BY fuel_mult ASC",
             $track_venue,
             $car_type
         ), ARRAY_A);
@@ -2220,119 +2263,291 @@ class Apex_Notes_DB {
     }
     
     /**
-     * Update community averages for a track+car combination
-     * This recalculates from all shared sessions
+     * Minimum valid laps a session must contain to count toward community averages.
+     * Smaller stints (crashes, early exits) are noisy — 3 valid laps is a good floor.
+     */
+    const APEX_FUEL_MIN_VALID_LAPS = 3;
+
+    /**
+     * Update community averages for a track+car combination.
+     *
+     * As of v1.19 averages are bucketed by fuel_mult so 1x, 2x, 3x sessions
+     * never contaminate each other. Each call recalculates all buckets for
+     * the given track+car from shared sessions that meet the minimum
+     * valid-lap threshold.
+     *
+     * We use a median and an IQR-trimmed mean to reduce outlier sensitivity.
+     * Race sessions are preferred over Practice/Qualifying when both exist.
      */
     public static function update_community_average($track_venue, $car_type) {
         global $wpdb;
         $sessions_table = $wpdb->prefix . 'apex_notes_fuel_sessions';
         $laps_table = $wpdb->prefix . 'apex_notes_fuel_laps';
         $averages_table = $wpdb->prefix . 'apex_notes_fuel_averages';
-        
-        // Get all valid laps from shared sessions for this track+car
-        $stats = $wpdb->get_row($wpdb->prepare(
-            "SELECT 
-                COUNT(DISTINCT s.id) as sample_count,
-                COUNT(l.id) as lap_count,
-                AVG(l.fuel_used) as avg_fuel_percent,
-                MIN(l.fuel_used) as min_fuel_percent,
-                MAX(l.fuel_used) as max_fuel_percent,
-                STDDEV(l.fuel_used) as std_dev_fuel,
-                AVG(l.ve_used) as avg_ve_percent,
-                MIN(l.ve_used) as min_ve_percent,
-                MAX(l.ve_used) as max_ve_percent,
-                AVG(l.lap_time) as avg_lap_time,
-                s.car_class
-            FROM $sessions_table s
-            JOIN $laps_table l ON s.id = l.session_id
-            WHERE s.track_venue = %s 
-                AND s.car_type = %s 
-                AND s.shared_with_community = 1
-                AND l.is_valid = 1
-            GROUP BY s.track_venue, s.car_type",
+
+        // Distinct fuel multipliers present for this track+car
+        $mults = $wpdb->get_col($wpdb->prepare(
+            "SELECT DISTINCT fuel_mult
+             FROM $sessions_table
+             WHERE track_venue = %s
+               AND car_type = %s
+               AND shared_with_community = 1
+               AND valid_laps >= %d",
+            $track_venue,
+            $car_type,
+            self::APEX_FUEL_MIN_VALID_LAPS
+        ));
+
+        // Remove stale rows for this track+car — buckets that no longer have data
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM $averages_table WHERE track_venue = %s AND car_type = %s",
             $track_venue,
             $car_type
-        ), ARRAY_A);
-        
-        if (!$stats || $stats['sample_count'] == 0) {
+        ));
+
+        if (empty($mults)) {
             return false;
         }
-        
-        // Get average pitstops and fuel_mult info from sessions
-        $session_stats = $wpdb->get_row($wpdb->prepare(
-            "SELECT 
-                AVG(pitstops) as avg_pitstops,
-                MIN(fuel_mult) as min_fuel_mult,
-                MAX(fuel_mult) as max_fuel_mult,
-                AVG(fuel_mult) as avg_fuel_mult
-            FROM $sessions_table
-            WHERE track_venue = %s 
-                AND car_type = %s 
-                AND shared_with_community = 1",
-            $track_venue,
-            $car_type
-        ), ARRAY_A);
-        
-        // Determine fuel_mult note
-        $fuel_mult_note = '1x';
-        if ($session_stats) {
-            $min_mult = floatval($session_stats['min_fuel_mult']);
-            $max_mult = floatval($session_stats['max_fuel_mult']);
-            $avg_mult = floatval($session_stats['avg_fuel_mult']);
-            
-            if ($min_mult == $max_mult && $min_mult != 1.0) {
-                // All sessions have same non-1x multiplier
-                $fuel_mult_note = $min_mult . 'x';
-            } elseif ($min_mult != $max_mult) {
-                // Mixed multipliers
-                $fuel_mult_note = 'Mixed';
-            }
-        }
-        
-        // Get tank capacity
+
+        $updated_buckets = 0;
         $tank_capacity = self::get_tank_capacity($car_type);
         if (!$tank_capacity) {
             $tank_capacity = 100; // Default fallback
         }
-        
-        // Convert percentages to liters
-        $avg_fuel_liters = $stats['avg_fuel_percent'] * $tank_capacity;
-        $min_fuel_liters = $stats['min_fuel_percent'] * $tank_capacity;
-        $max_fuel_liters = $stats['max_fuel_percent'] * $tank_capacity;
-        $std_dev_fuel = $stats['std_dev_fuel'] * $tank_capacity;
-        
-        // Check if record exists
-        $exists = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM $averages_table WHERE track_venue = %s AND car_type = %s",
-            $track_venue,
-            $car_type
-        ));
-        
-        $data = array(
-            'track_venue' => $track_venue,
-            'car_type' => $car_type,
-            'car_class' => $stats['car_class'],
-            'sample_count' => $stats['sample_count'],
-            'lap_count' => $stats['lap_count'],
-            'avg_fuel_liters' => $avg_fuel_liters,
-            'min_fuel_liters' => $min_fuel_liters,
-            'max_fuel_liters' => $max_fuel_liters,
-            'std_dev_fuel' => $std_dev_fuel,
-            'avg_ve_percent' => $stats['avg_ve_percent'],
-            'min_ve_percent' => $stats['min_ve_percent'],
-            'max_ve_percent' => $stats['max_ve_percent'],
-            'avg_lap_time' => $stats['avg_lap_time'],
-            'avg_pitstops' => $session_stats ? $session_stats['avg_pitstops'] : null,
-            'fuel_mult_note' => $fuel_mult_note
-        );
-        
-        if ($exists) {
-            $wpdb->update($averages_table, $data, array('id' => $exists));
-        } else {
+
+        foreach ($mults as $raw_mult) {
+            $fuel_mult = floatval($raw_mult);
+
+            // Pull all valid laps for this bucket
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT l.fuel_used, l.ve_used, l.lap_time, s.car_class
+                 FROM $sessions_table s
+                 JOIN $laps_table l ON s.id = l.session_id
+                 WHERE s.track_venue = %s
+                   AND s.car_type = %s
+                   AND s.fuel_mult = %f
+                   AND s.shared_with_community = 1
+                   AND s.valid_laps >= %d
+                   AND l.is_valid = 1",
+                $track_venue,
+                $car_type,
+                $fuel_mult,
+                self::APEX_FUEL_MIN_VALID_LAPS
+            ), ARRAY_A);
+
+            if (count($rows) < self::APEX_FUEL_MIN_VALID_LAPS) {
+                continue;
+            }
+
+            $fuel_values = array();
+            $ve_values = array();
+            $lap_times = array();
+            $car_class = '';
+            foreach ($rows as $r) {
+                if ($r['fuel_used'] !== null) {
+                    $fuel_values[] = floatval($r['fuel_used']);
+                }
+                if ($r['ve_used'] !== null && $r['ve_used'] !== '') {
+                    $ve_values[] = floatval($r['ve_used']);
+                }
+                if ($r['lap_time'] !== null && $r['lap_time'] > 0) {
+                    $lap_times[] = floatval($r['lap_time']);
+                }
+                if (!$car_class) {
+                    $car_class = $r['car_class'];
+                }
+            }
+
+            // Trim outliers via IQR on fuel values
+            $trimmed_fuel = self::iqr_trim($fuel_values);
+            if (empty($trimmed_fuel)) {
+                continue;
+            }
+
+            $avg_fuel_percent = array_sum($trimmed_fuel) / count($trimmed_fuel);
+            $median_fuel_percent = self::median($trimmed_fuel);
+            $min_fuel_percent = min($trimmed_fuel);
+            $max_fuel_percent = max($trimmed_fuel);
+            $std_dev_fuel = self::std_dev($trimmed_fuel);
+
+            // VE values — also trim
+            $avg_ve = null;
+            $median_ve = null;
+            $min_ve = null;
+            $max_ve = null;
+            if (!empty($ve_values)) {
+                $trimmed_ve = self::iqr_trim($ve_values);
+                if (!empty($trimmed_ve)) {
+                    $avg_ve = array_sum($trimmed_ve) / count($trimmed_ve);
+                    $median_ve = self::median($trimmed_ve);
+                    $min_ve = min($trimmed_ve);
+                    $max_ve = max($trimmed_ve);
+                }
+            }
+
+            $avg_lap_time = !empty($lap_times) ? array_sum($lap_times) / count($lap_times) : null;
+
+            // Session-level stats for this bucket
+            $session_stats = $wpdb->get_row($wpdb->prepare(
+                "SELECT COUNT(*) as sample_count, AVG(pitstops) as avg_pitstops
+                 FROM $sessions_table
+                 WHERE track_venue = %s
+                   AND car_type = %s
+                   AND fuel_mult = %f
+                   AND shared_with_community = 1
+                   AND valid_laps >= %d",
+                $track_venue,
+                $car_type,
+                $fuel_mult,
+                self::APEX_FUEL_MIN_VALID_LAPS
+            ), ARRAY_A);
+
+            // Convert tank-fraction values to liters
+            $data = array(
+                'track_venue' => $track_venue,
+                'car_type' => $car_type,
+                'car_class' => $car_class,
+                'fuel_mult' => $fuel_mult,
+                'sample_count' => $session_stats ? intval($session_stats['sample_count']) : 0,
+                'lap_count' => count($trimmed_fuel),
+                'avg_fuel_liters' => $avg_fuel_percent * $tank_capacity,
+                'median_fuel_liters' => $median_fuel_percent * $tank_capacity,
+                'min_fuel_liters' => $min_fuel_percent * $tank_capacity,
+                'max_fuel_liters' => $max_fuel_percent * $tank_capacity,
+                'std_dev_fuel' => $std_dev_fuel * $tank_capacity,
+                'avg_ve_percent' => $avg_ve,
+                'median_ve_percent' => $median_ve,
+                'min_ve_percent' => $min_ve,
+                'max_ve_percent' => $max_ve,
+                'avg_lap_time' => $avg_lap_time,
+                'avg_pitstops' => $session_stats ? $session_stats['avg_pitstops'] : null,
+                'fuel_mult_note' => $fuel_mult == 1.0 ? '1x' : $fuel_mult . 'x',
+            );
+
             $wpdb->insert($averages_table, $data);
+            $updated_buckets++;
         }
-        
-        return true;
+
+        return $updated_buckets > 0;
+    }
+
+    /**
+     * Compute median of a numeric array.
+     */
+    private static function median(array $values) {
+        if (empty($values)) {
+            return null;
+        }
+        sort($values);
+        $n = count($values);
+        $mid = intdiv($n, 2);
+        return ($n % 2 === 1) ? $values[$mid] : ($values[$mid - 1] + $values[$mid]) / 2.0;
+    }
+
+    /**
+     * Compute population standard deviation.
+     */
+    private static function std_dev(array $values) {
+        $n = count($values);
+        if ($n < 2) {
+            return 0.0;
+        }
+        $mean = array_sum($values) / $n;
+        $sq_sum = 0.0;
+        foreach ($values as $v) {
+            $sq_sum += ($v - $mean) ** 2;
+        }
+        return sqrt($sq_sum / $n);
+    }
+
+    /**
+     * Trim outliers using 1.5 * IQR rule.
+     * Returns the subset of $values within [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+     * For small arrays (< 4), returns values unchanged.
+     */
+    private static function iqr_trim(array $values) {
+        $n = count($values);
+        if ($n < 4) {
+            return $values;
+        }
+        sort($values);
+        $q1 = self::percentile($values, 25);
+        $q3 = self::percentile($values, 75);
+        $iqr = $q3 - $q1;
+        $lower = $q1 - 1.5 * $iqr;
+        $upper = $q3 + 1.5 * $iqr;
+        $out = array();
+        foreach ($values as $v) {
+            if ($v >= $lower && $v <= $upper) {
+                $out[] = $v;
+            }
+        }
+        // If trim removed everything (degenerate distribution), fall back to original
+        return !empty($out) ? $out : $values;
+    }
+
+    /**
+     * Linear-interpolated percentile on a sorted array.
+     */
+    private static function percentile(array $sorted, $pct) {
+        $n = count($sorted);
+        if ($n === 0) {
+            return 0.0;
+        }
+        if ($n === 1) {
+            return $sorted[0];
+        }
+        $rank = ($pct / 100) * ($n - 1);
+        $lower = (int) floor($rank);
+        $upper = (int) ceil($rank);
+        if ($lower === $upper) {
+            return $sorted[$lower];
+        }
+        $weight = $rank - $lower;
+        return $sorted[$lower] * (1 - $weight) + $sorted[$upper] * $weight;
+    }
+
+    /**
+     * One-off migration: rename the old UNIQUE KEY on fuel_averages from
+     * (track_venue, car_type) to (track_venue, car_type, fuel_mult), and
+     * ensure new columns exist. Safe to run multiple times.
+     */
+    public static function migrate_fuel_averages_schema() {
+        global $wpdb;
+        $table = $wpdb->prefix . 'apex_notes_fuel_averages';
+
+        if ($wpdb->get_var("SHOW TABLES LIKE '$table'") != $table) {
+            return;
+        }
+
+        // Add fuel_mult column if missing
+        $col = $wpdb->get_results("SHOW COLUMNS FROM $table LIKE 'fuel_mult'");
+        if (empty($col)) {
+            $wpdb->query("ALTER TABLE $table ADD COLUMN fuel_mult decimal(3,2) NOT NULL DEFAULT 1.00 AFTER car_class");
+        }
+        // Add median columns if missing
+        $col = $wpdb->get_results("SHOW COLUMNS FROM $table LIKE 'median_fuel_liters'");
+        if (empty($col)) {
+            $wpdb->query("ALTER TABLE $table ADD COLUMN median_fuel_liters decimal(6,3) DEFAULT NULL AFTER avg_fuel_liters");
+        }
+        $col = $wpdb->get_results("SHOW COLUMNS FROM $table LIKE 'median_ve_percent'");
+        if (empty($col)) {
+            $wpdb->query("ALTER TABLE $table ADD COLUMN median_ve_percent decimal(6,4) DEFAULT NULL AFTER avg_ve_percent");
+        }
+
+        // Replace the old 2-column unique key with a 3-column one
+        $idx = $wpdb->get_results("SHOW INDEX FROM $table WHERE Key_name = 'track_car'");
+        if (!empty($idx)) {
+            $wpdb->query("ALTER TABLE $table DROP INDEX track_car");
+        }
+        $idx = $wpdb->get_results("SHOW INDEX FROM $table WHERE Key_name = 'track_car_mult'");
+        if (empty($idx)) {
+            // Suppress errors — will fail silently if duplicate rows exist,
+            // in which case the recalc will de-duplicate on next update.
+            $suppress = $wpdb->suppress_errors(true);
+            $wpdb->query("ALTER TABLE $table ADD UNIQUE KEY track_car_mult (track_venue, car_type, fuel_mult)");
+            $wpdb->suppress_errors($suppress);
+        }
     }
     
     /**

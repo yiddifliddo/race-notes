@@ -752,6 +752,10 @@ class Apex_Notes_Shortcode {
                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
                                 Community Data
                             </button>
+                            <button class="apex-fuel-tab" data-fuel-tab="pit-strategy">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                                Pit Strategy &amp; AI
+                            </button>
                         </div>
                         
                         <!-- Upload Tab -->
@@ -764,9 +768,9 @@ class Apex_Notes_Shortcode {
                                         <line x1="12" y1="3" x2="12" y2="15"/>
                                     </svg>
                                 </div>
-                                <h3>Drop your LMU <strong>RACE</strong> session XML file here</h3>
+                                <h3>Drop your LMU session XML file here</h3>
                                 <p>or click to browse</p>
-                                <p class="apex-fuel-upload-hint">Look for files ending in <code>-R1.xml</code> or <code>-R2.xml</code> (Race sessions)</p>
+                                <p class="apex-fuel-upload-hint">Race (<code>-R1.xml</code>/<code>-R2.xml</code>), Practice, Qualifying, and TestDay are all supported.</p>
                                 <p class="apex-fuel-upload-hint">Located in: <code>Documents\My Games\Le Mans Ultimate\UserData\Log\Results\</code></p>
                                 <input type="file" id="apex-fuel-file-input" accept=".xml" style="display:none;">
                             </div>
@@ -963,23 +967,86 @@ class Apex_Notes_Shortcode {
                                 <p>Be the first to contribute!</p>
                             </div>
                         </div>
-                        
+
+                        <!-- Pit Strategy & AI Tab -->
+                        <div class="apex-fuel-tab-content" data-fuel-content="pit-strategy">
+                            <div class="apex-pit-calc">
+                                <div class="apex-pit-calc-header">
+                                    <h3>Pit-Stop Calculator</h3>
+                                    <p>Work out optimal pit laps from your uploaded session data. AI chat below can explain or refine the plan.</p>
+                                </div>
+                                <div class="apex-pit-calc-grid">
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-session">Base on session</label>
+                                        <select id="apex-pit-session" class="apex-select">
+                                            <option value="">Loading your sessions…</option>
+                                        </select>
+                                    </div>
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-race-laps">Race length (laps)</label>
+                                        <input type="number" id="apex-pit-race-laps" min="1" step="1" placeholder="e.g. 24">
+                                    </div>
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-race-minutes">…or minutes</label>
+                                        <input type="number" id="apex-pit-race-minutes" min="1" step="1" placeholder="e.g. 60">
+                                    </div>
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-reserve">Fuel reserve (L)</label>
+                                        <input type="number" id="apex-pit-reserve" min="0" step="0.1" value="0.5">
+                                    </div>
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-avg-fuel">Fuel / lap (L) — override</label>
+                                        <input type="number" id="apex-pit-avg-fuel" min="0" step="0.01" placeholder="auto from session">
+                                    </div>
+                                    <div class="apex-pit-calc-field">
+                                        <label for="apex-pit-tank">Tank (L) — override</label>
+                                        <input type="number" id="apex-pit-tank" min="0" step="0.1" placeholder="auto from car">
+                                    </div>
+                                </div>
+                                <div class="apex-pit-calc-actions">
+                                    <button class="apex-btn apex-btn-primary" id="apex-pit-calc-run">Calculate Pit Plan</button>
+                                </div>
+                                <div class="apex-pit-calc-result" id="apex-pit-calc-result" style="display:none;"></div>
+                            </div>
+
+                            <div class="apex-fuel-ai-chat">
+                                <div class="apex-fuel-ai-header">
+                                    <h3>Ask ApexFuelBot</h3>
+                                    <p>Questions about stint strategy, pace, or "when should I pit?" — grounded in your uploaded data.</p>
+                                </div>
+                                <div class="apex-fuel-ai-messages" id="apex-fuel-ai-messages">
+                                    <div class="apex-fuel-ai-empty">
+                                        <p>Try:</p>
+                                        <button class="apex-fuel-ai-suggestion" data-query="What's the best lap to pit in a 45-minute race?">When should I pit in a 45-minute race?</button>
+                                        <button class="apex-fuel-ai-suggestion" data-query="Am I burning more fuel than the community average?">Am I burning more fuel than the community?</button>
+                                        <button class="apex-fuel-ai-suggestion" data-query="Plan a 2-stop strategy for a 3-hour race.">Plan a 2-stop strategy for a 3-hour race</button>
+                                    </div>
+                                </div>
+                                <div class="apex-fuel-ai-input-row">
+                                    <textarea id="apex-fuel-ai-input" rows="2" placeholder="Ask about your fuel data…"></textarea>
+                                    <button class="apex-btn apex-btn-primary" id="apex-fuel-ai-send">Send</button>
+                                </div>
+                                <p class="apex-fuel-ai-hint">Limit: 30 questions/day per user. Uses your most recent uploaded sessions as context.</p>
+                            </div>
+                        </div>
+
                         <div class="apex-fuel-info">
                             <h4>How it works</h4>
                             <ol>
-                                <li><strong>Complete a Race in LMU</strong> - Only RACE sessions are supported (not Practice/Qualifying)</li>
-                                <li><strong>Find your XML files</strong> - Look for files ending in <code>-R1.xml</code> or <code>-R2.xml</code></li>
-                                <li><strong>Upload here</strong> - We'll extract fuel data automatically</li>
-                                <li><strong>Share with community</strong> - Help build accurate fuel data for everyone</li>
+                                <li><strong>Upload your LMU session XML</strong> - Race, Practice, Qualifying, or TestDay all work</li>
+                                <li><strong>Find your XML files</strong> - Look in the LMU results folder (path below)</li>
+                                <li><strong>We extract fuel data automatically</strong> - Pit laps and out-laps are excluded from averages</li>
+                                <li><strong>Share anonymously</strong> - Help build accurate community medians (bucketed by fuel multiplier)</li>
+                                <li><strong>Plan stints & ask AI</strong> - Use the Pit Strategy tab for a calculator and fuel-specific chatbot</li>
                             </ol>
                             <p class="apex-fuel-info-note">Files are in: <code>Documents\My Games\Le Mans Ultimate\UserData\Log\Results\</code></p>
-                            <p class="apex-fuel-info-note">Your data is anonymous when shared. The more sessions uploaded, the more accurate the community averages become!</p>
+                            <p class="apex-fuel-info-note">Your data is anonymous when shared. Community averages use median + IQR outlier trim and are bucketed separately per fuel multiplier.</p>
                         </div>
                     </div>
                     <?php endif; ?>
                 </div>
             </div>
-            
+
             <!-- Tire Data Page -->
             <div class="apex-page" data-page="tire-data">
                 <div class="apex-main-content">

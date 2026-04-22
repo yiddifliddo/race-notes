@@ -33,71 +33,254 @@ class Apex_Notes_XML_Parser {
     
     /**
      * Parse XML content string
-     * 
+     *
      * @param string $xml_content Raw XML content
      * @param string $source_file Optional source filename for hash
+     * @param string|null $driver_name Optional: find this specific driver by <Name>.
+     *        Required for multiplayer XMLs where every driver has isPlayer=1.
      * @return array|WP_Error Parsed data or error
      */
-    public static function parse_content($xml_content, $source_file = '') {
+    public static function parse_content($xml_content, $source_file = '', $driver_name = null) {
         // Suppress XML errors and handle them manually
         libxml_use_internal_errors(true);
-        
+
         // Parse XML
         $xml = simplexml_load_string($xml_content);
-        
+
         if ($xml === false) {
             $errors = libxml_get_errors();
             libxml_clear_errors();
             return new WP_Error('xml_parse_error', 'Failed to parse XML: ' . ($errors[0]->message ?? 'Unknown error'));
         }
-        
+
         // Verify this is an rFactor/LMU results file
         if (!isset($xml->RaceResults)) {
             return new WP_Error('invalid_format', 'Not a valid LMU/rFactor results file');
         }
-        
+
         $results = $xml->RaceResults;
-        
+
         // Extract session metadata
         $session_data = self::extract_session_metadata($results, $xml_content, $source_file);
-        
+
         if (is_wp_error($session_data)) {
             return $session_data;
         }
-        
+
         // Find the player's driver data
-        $player_data = self::find_player_driver($results);
-        
+        $player_data = self::find_player_driver($results, $driver_name);
+
         if (is_wp_error($player_data)) {
             return $player_data;
         }
-        
+
         // Update session data with player car info
         $session_data['car_type'] = (string) $player_data['driver']->CarType;
         $session_data['car_class'] = self::normalize_car_class((string) $player_data['driver']->CarClass);
-        
+
         // Extract position data (Race sessions)
         $driver = $player_data['driver'];
         $session_data['grid_position'] = isset($driver->GridPos) ? intval($driver->GridPos) : null;
         $session_data['finish_position'] = isset($driver->Position) ? intval($driver->Position) : null;
-        
+
         // Extract lap data
         $laps = self::extract_lap_data($player_data['driver'], $session_data['car_type']);
-        
+
         // Calculate session statistics
         $stats = self::calculate_statistics($laps, $session_data['car_type']);
-        
+
         // Merge stats into session data
         $session_data = array_merge($session_data, $stats);
-        
+
         return array(
             'session' => $session_data,
             'laps' => $laps,
-            'player_name' => (string) $player_data['driver']->n,
+            'player_name' => (string) $player_data['driver']->Name,
             'session_type_name' => $player_data['session_type']
         );
     }
-    
+
+    /**
+     * List every driver in the XML along with summary info, so the user
+     * can pick which one is them (especially for multiplayer XMLs where
+     * LMU flags every driver as isPlayer=1).
+     *
+     * @param string $xml_content
+     * @return array|WP_Error List of { name, car, class, laps, pits, grid, finish, is_player, has_laps, session_type }
+     */
+    public static function list_candidates($xml_content) {
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($xml_content);
+        if ($xml === false || !isset($xml->RaceResults)) {
+            libxml_clear_errors();
+            return new WP_Error('invalid_format', 'Not a valid LMU/rFactor results file');
+        }
+        $results = $xml->RaceResults;
+
+        $session_names = self::ordered_session_names($results);
+        $out = array();
+        $seen_names = array();
+
+        foreach ($session_names as $session_type) {
+            $session = $results->$session_type;
+            if (!isset($session->Driver)) {
+                continue;
+            }
+            foreach ($session->Driver as $driver) {
+                $name = trim((string) $driver->Name);
+                if ($name === '') {
+                    continue;
+                }
+                // Only list each driver once across sessions (prefer Race info)
+                $key = strtolower($name);
+                if (isset($seen_names[$key])) {
+                    continue;
+                }
+                $seen_names[$key] = true;
+                $out[] = array(
+                    'name' => $name,
+                    'car' => (string) $driver->CarType,
+                    'class_raw' => (string) $driver->CarClass,
+                    'class' => self::normalize_car_class((string) $driver->CarClass),
+                    'car_number' => isset($driver->CarNumber) ? (string) $driver->CarNumber : '',
+                    'team' => isset($driver->TeamName) ? (string) $driver->TeamName : '',
+                    'veh_name' => isset($driver->VehName) ? (string) $driver->VehName : '',
+                    'is_player' => ((string) $driver->isPlayer === '1'),
+                    'has_laps' => self::driver_has_laps($driver),
+                    'grid' => isset($driver->GridPos) ? intval($driver->GridPos) : null,
+                    'finish' => isset($driver->Position) ? intval($driver->Position) : null,
+                    'total_laps' => isset($driver->Laps) ? intval($driver->Laps) : null,
+                    'pitstops' => isset($driver->Pitstops) ? intval($driver->Pitstops) : null,
+                    'finish_status' => isset($driver->FinishStatus) ? (string) $driver->FinishStatus : '',
+                    'best_lap_time' => isset($driver->BestLapTime) ? floatval($driver->BestLapTime) : null,
+                    'session_type' => $session_type,
+                );
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Build an ordered list of session-type element names that actually
+     * contain <Driver> children. Preferred order: Race > Qualifying > Practice > etc.
+     */
+    private static function ordered_session_names($results) {
+        $preferred = array(
+            'Race', 'Race1', 'Race2', 'Race3',
+            'Qualifying', 'Qualifying1', 'Qualifying2', 'Qualifying3',
+            'Practice', 'Practice1', 'Practice2', 'Practice3', 'Practice4',
+            'WarmUp', 'Warmup',
+            'TestDay', 'Test'
+        );
+        $seen = array();
+        $names = array();
+        foreach ($preferred as $name) {
+            if (isset($results->$name) && isset($results->$name->Driver)) {
+                $names[] = $name;
+                $seen[$name] = true;
+            }
+        }
+        foreach ($results->children() as $child) {
+            $n = $child->getName();
+            if (isset($seen[$n])) {
+                continue;
+            }
+            if (isset($child->Driver)) {
+                $names[] = $n;
+                $seen[$n] = true;
+            }
+        }
+        return $names;
+    }
+
+    /**
+     * Find the player's driver data.
+     *
+     * Selection rules, in order:
+     * 1. If $preferred_name is given: return the driver whose <Name> matches
+     *    (case-insensitive, trimmed) and has lap data. This is the ONLY safe
+     *    path for multiplayer XMLs where every driver has isPlayer=1.
+     * 2. Else, if exactly one driver across all sessions has isPlayer=1 AND
+     *    has laps, return that driver (offline / solo XML — unambiguous).
+     * 3. Else, if the XML has a single driver total with laps, return it
+     *    (solo hotlap/test with no isPlayer flag set).
+     * 4. Else, return WP_Error('multiple_candidates') so the caller can
+     *    prompt the user to pick. The list is retrievable via list_candidates().
+     */
+    private static function find_player_driver($results, $preferred_name = null) {
+        $session_names = self::ordered_session_names($results);
+
+        // Case 1: caller specified a driver name — exact match wins
+        if ($preferred_name !== null && $preferred_name !== '') {
+            $needle = strtolower(trim($preferred_name));
+            foreach ($session_names as $session_type) {
+                $session = $results->$session_type;
+                if (!isset($session->Driver)) {
+                    continue;
+                }
+                foreach ($session->Driver as $driver) {
+                    $n = strtolower(trim((string) $driver->Name));
+                    if ($n === $needle && self::driver_has_laps($driver)) {
+                        return array('driver' => $driver, 'session_type' => $session_type);
+                    }
+                }
+            }
+            return new WP_Error('driver_not_found', 'Driver "' . $preferred_name . '" not found in this XML.');
+        }
+
+        // Count isPlayer=1 drivers across all sessions
+        $player_drivers = array();
+        $all_drivers_with_laps = array();
+        foreach ($session_names as $session_type) {
+            $session = $results->$session_type;
+            if (!isset($session->Driver)) {
+                continue;
+            }
+            foreach ($session->Driver as $driver) {
+                if (!self::driver_has_laps($driver)) {
+                    continue;
+                }
+                $all_drivers_with_laps[] = array('driver' => $driver, 'session_type' => $session_type);
+                if ((string) $driver->isPlayer === '1') {
+                    $player_drivers[] = array('driver' => $driver, 'session_type' => $session_type);
+                }
+            }
+        }
+
+        // Case 2: exactly one isPlayer=1 with laps — offline XML, unambiguous
+        if (count($player_drivers) === 1) {
+            return $player_drivers[0];
+        }
+
+        // Case 3: single-driver solo XML with no isPlayer flag
+        if (count($player_drivers) === 0 && count($all_drivers_with_laps) === 1) {
+            return $all_drivers_with_laps[0];
+        }
+
+        // Case 4: ambiguous — multiple drivers flagged isPlayer=1 (multiplayer)
+        if (count($player_drivers) > 1) {
+            return new WP_Error(
+                'multiple_candidates',
+                'This XML contains ' . count($player_drivers) . ' drivers — please pick which one is you.'
+            );
+        }
+
+        return new WP_Error('no_player_data', 'No driver with lap data found in this XML.');
+    }
+
+    /**
+     * Does this driver element contain any <Lap> children?
+     */
+    private static function driver_has_laps($driver) {
+        foreach ($driver->children() as $child) {
+            if ($child->getName() === 'Lap') {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * Extract session metadata from XML
      */
@@ -124,132 +307,8 @@ class Apex_Notes_XML_Parser {
             'tire_mult' => floatval($results->TireMult) ?: 1.0,
         );
     }
-    
-    /**
-     * Find the player's driver data in the XML
-     * Returns the driver with isPlayer=1 from Practice, Qualifying, or Race.
-     *
-     * Handles several LMU/rFactor XML layouts:
-     *  - Offline: <RaceResults><Race><Driver>...</Driver></Race></RaceResults>
-     *             (session container wraps Driver elements directly)
-     *  - Online:  <RaceResults><Race><Race><Driver>...</Driver></Race></Race></RaceResults>
-     *             (multiplayer nests drivers one level deeper; changelog note 1.18.3)
-     *  - Solo test sessions with a single driver and no <isPlayer> flag.
-     *
-     * Also accepts any session-type element that contains Driver elements
-     * (Race, Race1, Race2, Qualifying, Qualifying1-3, Practice, Practice1-3,
-     *  TestDay, WarmUp, etc.) so we don't break when LMU adds new session names.
-     */
-    private static function find_player_driver($results) {
-        // Preferred order — Race data is best, then Qualifying, then Practice.
-        $preferred = array(
-            'Race', 'Race1', 'Race2', 'Race3',
-            'Qualifying', 'Qualifying1', 'Qualifying2', 'Qualifying3',
-            'Practice', 'Practice1', 'Practice2', 'Practice3', 'Practice4',
-            'WarmUp', 'Warmup',
-            'TestDay', 'Test'
-        );
 
-        // Build ordered list: preferred first, then any other session-like child
-        // that wasn't in the preferred list (so we tolerate unknown session names).
-        $seen = array();
-        $session_names = array();
-        foreach ($preferred as $name) {
-            if (isset($results->$name)) {
-                $session_names[] = $name;
-                $seen[$name] = true;
-            }
-        }
-        foreach ($results->children() as $child) {
-            $name = $child->getName();
-            if (isset($seen[$name])) {
-                continue;
-            }
-            // Heuristic: only consider elements that contain at least one Driver
-            if (isset($child->Driver) || (isset($child->Race) && isset($child->Race->Driver))) {
-                $session_names[] = $name;
-                $seen[$name] = true;
-            }
-        }
 
-        foreach ($session_names as $session_type) {
-            $session = $results->$session_type;
-
-            // Collect candidate driver containers. Multiplayer XMLs nest drivers
-            // under <Race> inside the session element; offline XMLs put them
-            // directly under the session element.
-            $containers = array($session);
-            if (isset($session->Race)) {
-                $containers[] = $session->Race;
-            }
-            if (isset($session->Qualifying)) {
-                $containers[] = $session->Qualifying;
-            }
-            if (isset($session->Practice)) {
-                $containers[] = $session->Practice;
-            }
-
-            // First pass: look for isPlayer=1 with lap data
-            foreach ($containers as $container) {
-                if (!isset($container->Driver)) {
-                    continue;
-                }
-                foreach ($container->Driver as $driver) {
-                    if ((string) $driver->isPlayer === '1' && self::driver_has_laps($driver)) {
-                        return array(
-                            'driver' => $driver,
-                            'session_type' => $session_type
-                        );
-                    }
-                }
-            }
-
-            // Second pass: any driver flagged isPlayer (even without laps — covers
-            // XMLs that store laps elsewhere; extract_lap_data will simply find none)
-            foreach ($containers as $container) {
-                if (!isset($container->Driver)) {
-                    continue;
-                }
-                foreach ($container->Driver as $driver) {
-                    if ((string) $driver->isPlayer === '1') {
-                        return array(
-                            'driver' => $driver,
-                            'session_type' => $session_type
-                        );
-                    }
-                }
-            }
-
-            // Third pass: if there's only one driver (solo hotlap/test), use it.
-            foreach ($containers as $container) {
-                if (!isset($container->Driver)) {
-                    continue;
-                }
-                $drivers = $container->Driver;
-                if (count($drivers) === 1 && self::driver_has_laps($drivers[0])) {
-                    return array(
-                        'driver' => $drivers[0],
-                        'session_type' => $session_type
-                    );
-                }
-            }
-        }
-
-        return new WP_Error('no_player_data', 'No player lap data found in this session. Make sure you are uploading your own session XML.');
-    }
-
-    /**
-     * Does this driver element contain any <Lap> children?
-     */
-    private static function driver_has_laps($driver) {
-        foreach ($driver->children() as $child) {
-            if ($child->getName() === 'Lap') {
-                return true;
-            }
-        }
-        return false;
-    }
-    
     /**
      * Normalize car class names
      */
@@ -544,63 +603,89 @@ class Apex_Notes_XML_Parser {
     }
     
     /**
-     * Process uploaded XML file and save to database
+     * Process parsed XML content into a saved session.
+     *
+     * Accepts the XML content and an explicit driver name (the user's
+     * confirmed identity from the picker), parses for that driver, and
+     * saves to the DB.
+     *
+     * @param string $xml_content Raw XML
+     * @param int    $user_id
+     * @param string $driver_name The user-confirmed <Name> to save for
+     * @param bool   $share_with_community
+     * @param string $source_file Filename used for the session hash (dedupe)
+     * @return array|WP_Error
      */
-    public static function process_upload($file, $user_id, $share_with_community = false) {
-        // Validate file
-        $validation = self::validate_upload($file);
-        if (is_wp_error($validation)) {
-            return $validation;
-        }
-        
-        // Parse XML
-        $parsed = self::parse_file($file['tmp_name']);
+    public static function save_for_driver($xml_content, $user_id, $driver_name, $share_with_community = false, $source_file = '', $skip_community_update = false) {
+        $parsed = self::parse_content($xml_content, $source_file, $driver_name);
         if (is_wp_error($parsed)) {
             return $parsed;
         }
-        
-        // Accept all session types (Race, Practice, Qualifying, TestDay, WarmUp...).
-        // Community averages are still computed only from sessions with enough
-        // valid laps (see Apex_Notes_DB::update_community_average).
+
         $session_type = $parsed['session_type_name'];
         $session_data = $parsed['session'];
         $session_data['user_id'] = $user_id;
         $session_data['session_type'] = $session_type;
         $session_data['shared_with_community'] = $share_with_community ? 1 : 0;
-        
-        // Save session
+        // Include driver name in the session_hash so two different drivers in
+        // the same XML don't collide on the dedupe check. Also include user_id
+        // so ghost-imports from different uploaders stay distinct.
+        $session_data['session_hash'] = hash('sha256', ($source_file ?: $xml_content) . '|' . strtolower(trim($driver_name)) . '|u' . $user_id);
+
         $result = Apex_Notes_DB::save_fuel_session($session_data);
-        
         if (isset($result['error'])) {
             return new WP_Error('duplicate', $result['error']);
         }
-        
         $session_id = $result['session_id'];
-        
-        // Prepare and save laps
+
         $laps_to_save = array();
         foreach ($parsed['laps'] as $lap) {
             $lap['session_id'] = $session_id;
             $laps_to_save[] = $lap;
         }
-        
         Apex_Notes_DB::save_fuel_laps($laps_to_save);
-        
-        // Update community averages if shared
-        if ($share_with_community) {
+
+        if ($share_with_community && !$skip_community_update) {
             Apex_Notes_DB::update_community_average(
                 $session_data['track_venue'],
                 $session_data['car_type']
             );
         }
-        
+
         return array(
             'success' => true,
             'session_id' => $session_id,
             'session' => $session_data,
             'laps' => $parsed['laps'],
             'player_name' => $parsed['player_name'],
-            'session_type' => $parsed['session_type_name']
+            'session_type' => $parsed['session_type_name'],
+        );
+    }
+
+    /**
+     * Legacy wrapper: kept for back-compat. Requires an unambiguous XML
+     * (single isPlayer=1 or single driver). Multiplayer XMLs will return
+     * a WP_Error('multiple_candidates') which the caller must handle.
+     *
+     * @deprecated Prefer the explicit two-step flow: list_candidates() +
+     *             save_for_driver(). See class-apex-notes-ajax.php::upload_xml.
+     */
+    public static function process_upload($file, $user_id, $share_with_community = false) {
+        $validation = self::validate_upload($file);
+        if (is_wp_error($validation)) {
+            return $validation;
+        }
+        $xml_content = file_get_contents($file['tmp_name']);
+        $parsed = self::parse_content($xml_content, $file['tmp_name']);
+        if (is_wp_error($parsed)) {
+            return $parsed;
+        }
+        return self::save_for_driver(
+            $xml_content,
+            $user_id,
+            $parsed['player_name'],
+            $share_with_community,
+            $file['tmp_name']
         );
     }
 }

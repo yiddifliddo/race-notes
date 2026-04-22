@@ -75,6 +75,8 @@ class Apex_Notes_Ajax {
         
         // Fuel Data / XML Upload AJAX actions
         add_action('wp_ajax_apex_notes_upload_xml', array($this, 'upload_xml'));
+        add_action('wp_ajax_apex_notes_confirm_fuel_upload', array($this, 'confirm_fuel_upload'));
+        add_action('wp_ajax_apex_notes_save_lmu_driver_name', array($this, 'save_lmu_driver_name'));
         add_action('wp_ajax_apex_notes_get_fuel_sessions', array($this, 'get_fuel_sessions'));
         add_action('wp_ajax_apex_notes_get_fuel_session', array($this, 'get_fuel_session'));
         add_action('wp_ajax_apex_notes_share_fuel_session', array($this, 'share_fuel_session'));
@@ -2058,49 +2060,238 @@ CRITICAL RULES:
     }
     
     /**
-     * Upload and process XML file
+     * Step 1 of fuel upload: parse the XML, return all driver candidates,
+     * and stash the XML in a user-scoped transient. No DB writes happen here.
+     *
+     * The uploader must then call apex_notes_confirm_fuel_upload with the
+     * driver they confirmed is them (plus flags). This two-step flow is
+     * mandatory because LMU multiplayer XMLs flag EVERY driver as
+     * isPlayer=1 — we cannot guess which one is the uploader.
      */
     public function upload_xml() {
         $this->verify_nonce();
-        
+
         if (!is_user_logged_in()) {
             wp_send_json_error(array('message' => 'You must be logged in to upload data.'));
             return;
         }
-        
         if (!isset($_FILES['xml_file'])) {
             wp_send_json_error(array('message' => 'No file uploaded.'));
             return;
         }
-        
+
         $file = $_FILES['xml_file'];
+        $validation = Apex_Notes_XML_Parser::validate_upload($file);
+        if (is_wp_error($validation)) {
+            wp_send_json_error(array('message' => $validation->get_error_message()));
+            return;
+        }
+
+        $xml_content = file_get_contents($file['tmp_name']);
+        if ($xml_content === false || strlen($xml_content) < 100) {
+            wp_send_json_error(array('message' => 'Could not read uploaded file.'));
+            return;
+        }
+
+        $candidates = Apex_Notes_XML_Parser::list_candidates($xml_content);
+        if (is_wp_error($candidates)) {
+            wp_send_json_error(array('message' => $candidates->get_error_message()));
+            return;
+        }
+        // Filter out candidates with no lap data (spectators, crashed out at start)
+        $candidates = array_values(array_filter($candidates, function($c) {
+            return !empty($c['has_laps']);
+        }));
+        if (empty($candidates)) {
+            wp_send_json_error(array('message' => 'No drivers with lap data found in this XML.'));
+            return;
+        }
+
         $user_id = get_current_user_id();
-        $share_with_community = isset($_POST['share_with_community']) && $_POST['share_with_community'] === '1';
-        
-        // Process the upload
-        $result = Apex_Notes_XML_Parser::process_upload($file, $user_id, $share_with_community);
-        
+        $saved_name = (string) get_user_meta($user_id, 'apex_notes_lmu_driver_name', true);
+        $preselected = null;
+        if ($saved_name !== '') {
+            $needle = strtolower(trim($saved_name));
+            foreach ($candidates as $c) {
+                if (strtolower(trim($c['name'])) === $needle) {
+                    $preselected = $c['name'];
+                    break;
+                }
+            }
+        }
+        // Auto-preselect when only one candidate has isPlayer=1 (offline XML)
+        if ($preselected === null) {
+            $players = array_filter($candidates, function($c) { return !empty($c['is_player']); });
+            if (count($players) === 1) {
+                $only = array_values($players)[0];
+                $preselected = $only['name'];
+            }
+        }
+
+        // Stash XML in a transient keyed per-user
+        $upload_key = wp_generate_password(24, false, false);
+        set_transient(
+            'apex_fuel_upload_' . $user_id . '_' . $upload_key,
+            array(
+                'xml' => $xml_content,
+                'filename' => isset($file['name']) ? $file['name'] : '',
+            ),
+            30 * MINUTE_IN_SECONDS
+        );
+
+        // Sort candidates: player-flagged first, then by total_laps desc
+        usort($candidates, function($a, $b) {
+            if ($a['is_player'] !== $b['is_player']) {
+                return $b['is_player'] <=> $a['is_player'];
+            }
+            return ($b['total_laps'] ?? 0) <=> ($a['total_laps'] ?? 0);
+        });
+
+        // Metadata (track, date, etc.) — parse lightweight
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($xml_content);
+        $meta = array();
+        if ($xml && isset($xml->RaceResults)) {
+            $r = $xml->RaceResults;
+            $meta = array(
+                'track_venue' => (string) $r->TrackVenue,
+                'track_course' => (string) $r->TrackCourse,
+                'session_date' => (string) $r->TimeString,
+                'fuel_mult' => floatval($r->FuelMult) ?: 1.0,
+                'game_version' => (string) $r->GameVersion,
+            );
+        }
+        libxml_clear_errors();
+
+        wp_send_json_success(array(
+            'needs_selection' => true,
+            'upload_key' => $upload_key,
+            'preselected_name' => $preselected,
+            'saved_lmu_name' => $saved_name,
+            'candidates' => $candidates,
+            'metadata' => $meta,
+            'candidate_count' => count($candidates),
+        ));
+    }
+
+    /**
+     * Step 2: user has picked which driver is them. Save their session,
+     * plus anonymous ghost sessions for every OTHER driver (user_id=0,
+     * shared=1) so the community fuel database gets maximum data.
+     *
+     * Required POST:
+     *   upload_key   - transient key returned by upload_xml
+     *   driver_name  - the <Name> the user picked
+     * Optional POST:
+     *   share_with_community (0/1)        - share user's session (default 1)
+     *   import_other_drivers (0/1)        - import anonymous ghosts (default 1)
+     *   save_as_my_driver    (0/1)        - remember driver_name in user meta (default 1)
+     */
+    public function confirm_fuel_upload() {
+        $this->verify_nonce();
+
+        if (!is_user_logged_in()) {
+            wp_send_json_error(array('message' => 'You must be logged in.'));
+            return;
+        }
+
+        $user_id = get_current_user_id();
+        $upload_key = isset($_POST['upload_key']) ? sanitize_text_field($_POST['upload_key']) : '';
+        $driver_name = isset($_POST['driver_name']) ? sanitize_text_field(wp_unslash($_POST['driver_name'])) : '';
+        $share = !isset($_POST['share_with_community']) || $_POST['share_with_community'] === '1';
+        $import_ghosts = !isset($_POST['import_other_drivers']) || $_POST['import_other_drivers'] === '1';
+        $remember = !isset($_POST['save_as_my_driver']) || $_POST['save_as_my_driver'] === '1';
+
+        if (!$upload_key || !$driver_name) {
+            wp_send_json_error(array('message' => 'Missing upload reference or driver selection.'));
+            return;
+        }
+
+        $stash = get_transient('apex_fuel_upload_' . $user_id . '_' . $upload_key);
+        if (!is_array($stash) || empty($stash['xml'])) {
+            wp_send_json_error(array('message' => 'Upload expired. Please re-upload the XML.'));
+            return;
+        }
+        $xml_content = $stash['xml'];
+        $source_file = !empty($stash['filename']) ? $stash['filename'] : $upload_key;
+
+        // Save uploader's session
+        $result = Apex_Notes_XML_Parser::save_for_driver(
+            $xml_content,
+            $user_id,
+            $driver_name,
+            $share,
+            $source_file,
+            true // skip community update; we'll do it once at the end per (track,car)
+        );
         if (is_wp_error($result)) {
             wp_send_json_error(array('message' => $result->get_error_message()));
             return;
         }
-        
-        // Format response data
+
+        // Auto-register the user's car in the fuel_cars dropdown
+        $this->maybe_add_new_car($result['session']['car_type'], $result['session']['car_class']);
+
+        // Persist LMU driver name for next time
+        if ($remember) {
+            update_user_meta($user_id, 'apex_notes_lmu_driver_name', $driver_name);
+        }
+
+        // Import anonymous ghost sessions for the other drivers
+        $ghost_saved = 0;
+        $ghost_failed = 0;
+        $community_refresh = array();
+        // Always refresh community for uploader's car if shared
+        if ($share) {
+            $community_refresh[$result['session']['track_venue'] . '|' . $result['session']['car_type']] = array(
+                'track' => $result['session']['track_venue'],
+                'car' => $result['session']['car_type'],
+            );
+        }
+
+        if ($import_ghosts) {
+            $candidates = Apex_Notes_XML_Parser::list_candidates($xml_content);
+            if (!is_wp_error($candidates)) {
+                $needle = strtolower(trim($driver_name));
+                foreach ($candidates as $c) {
+                    if (empty($c['has_laps'])) continue;
+                    if (strtolower(trim($c['name'])) === $needle) continue;
+                    $ghost = Apex_Notes_XML_Parser::save_for_driver(
+                        $xml_content,
+                        0, // user_id=0 -> anonymous ghost, never appears in any user's "My Sessions"
+                        $c['name'],
+                        true, // always shared with community
+                        $source_file,
+                        true // skip community update (batched below)
+                    );
+                    if (is_wp_error($ghost)) {
+                        $ghost_failed++;
+                    } else {
+                        $ghost_saved++;
+                        $key = $ghost['session']['track_venue'] . '|' . $ghost['session']['car_type'];
+                        $community_refresh[$key] = array(
+                            'track' => $ghost['session']['track_venue'],
+                            'car' => $ghost['session']['car_type'],
+                        );
+                    }
+                }
+            }
+        }
+
+        // Single community-average refresh per (track, car) pair touched
+        foreach ($community_refresh as $tc) {
+            Apex_Notes_DB::update_community_average($tc['track'], $tc['car']);
+        }
+
+        // Clear the transient — upload consumed
+        delete_transient('apex_fuel_upload_' . $user_id . '_' . $upload_key);
+
+        // Build the standard display response
         $session = $result['session'];
         $laps = $result['laps'];
-        
-        // Auto-add new car to fuel cars list if not exists
-        $this->maybe_add_new_car($session['car_type'], $session['car_class']);
-        
-        // Get tank capacity for display
         $tank_capacity = Apex_Notes_DB::get_tank_capacity($session['car_type']);
-        
-        // Calculate valid lap stats for response
-        $valid_laps = array_filter($laps, function($lap) {
-            return $lap['is_valid'] === 1;
-        });
-        
-        $response = array(
+
+        wp_send_json_success(array(
             'session_id' => $result['session_id'],
             'player_name' => $result['player_name'],
             'session_type' => $result['session_type'],
@@ -2122,11 +2313,31 @@ CRITICAL RULES:
             'best_lap_time' => $session['best_lap_time'],
             'avg_lap_time_formatted' => Apex_Notes_XML_Parser::format_lap_time($session['avg_lap_time']),
             'best_lap_time_formatted' => Apex_Notes_XML_Parser::format_lap_time($session['best_lap_time']),
-            'shared' => $share_with_community,
-            'laps' => $laps
-        );
-        
-        wp_send_json_success($response);
+            'shared' => $share,
+            'laps' => $laps,
+            'ghost_sessions_imported' => $ghost_saved,
+            'ghost_sessions_failed' => $ghost_failed,
+        ));
+    }
+
+    /**
+     * Save the user's LMU driver name to user meta so future uploads can
+     * auto-match. Empty string clears the preference.
+     */
+    public function save_lmu_driver_name() {
+        $this->verify_nonce();
+        if (!is_user_logged_in()) {
+            wp_send_json_error(array('message' => 'You must be logged in.'));
+            return;
+        }
+        $user_id = get_current_user_id();
+        $name = isset($_POST['driver_name']) ? sanitize_text_field(wp_unslash($_POST['driver_name'])) : '';
+        if ($name === '') {
+            delete_user_meta($user_id, 'apex_notes_lmu_driver_name');
+        } else {
+            update_user_meta($user_id, 'apex_notes_lmu_driver_name', $name);
+        }
+        wp_send_json_success(array('saved_name' => $name));
     }
     
     /**

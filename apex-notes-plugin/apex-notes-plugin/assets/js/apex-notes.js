@@ -4003,22 +4003,18 @@
             showNotification('Please select an XML file', 'error');
             return;
         }
-        
-        // Show share option
-        $('#apex-fuel-share-option').show();
-        
+
         // Show loading state
         var $dropzone = $('#apex-fuel-dropzone');
         var originalContent = $dropzone.html();
-        $dropzone.html('<div class="apex-loading"><div class="apex-spinner"></div><p style="margin-top:1rem;color:rgba(255,255,255,0.6);">Analyzing session data...</p></div>');
-        
-        // Prepare form data
+        $dropzone.html('<div class="apex-loading"><div class="apex-spinner"></div><p style="margin-top:1rem;color:rgba(255,255,255,0.6);">Reading XML and identifying drivers…</p></div>');
+
+        // Step 1: upload + list candidates (no save)
         var formData = new FormData();
         formData.append('action', 'apex_notes_upload_xml');
         formData.append('nonce', apexNotesData.nonce);
         formData.append('xml_file', file);
-        formData.append('share_with_community', $('#apex-fuel-share-checkbox').is(':checked') ? '1' : '0');
-        
+
         $.ajax({
             url: apexNotesData.ajaxUrl,
             type: 'POST',
@@ -4027,8 +4023,7 @@
             contentType: false,
             success: function(response) {
                 if (response.success) {
-                    displayFuelResult(response.data);
-                    showNotification('Session analyzed successfully!', 'success');
+                    showDriverPicker(response.data, originalContent);
                 } else {
                     $dropzone.html(originalContent);
                     showNotification(response.data.message || 'Failed to process file', 'error');
@@ -4040,6 +4035,150 @@
             }
         });
     }
+
+    // Driver-picker step: user confirms which driver is them before we save.
+    // In LMU multiplayer XMLs every driver is flagged isPlayer=1, so we
+    // CANNOT guess which one is the uploader — this step is mandatory for
+    // correctness and stays visible even when auto-match succeeded.
+    function showDriverPicker(data, dropzoneOriginal) {
+        $('#apex-fuel-dropzone').hide();
+        $('#apex-fuel-share-option').hide();
+        $('#apex-fuel-result').hide();
+
+        var $picker = $('#apex-fuel-picker');
+        if (!$picker.length) {
+            $picker = $('<div id="apex-fuel-picker" class="apex-fuel-picker"></div>');
+            $('#apex-fuel-dropzone').after($picker);
+        }
+        $picker.show();
+
+        var meta = data.metadata || {};
+        var saved = data.saved_lmu_name || '';
+        var preselected = data.preselected_name || '';
+        var html =
+            '<div class="apex-fuel-picker-header">' +
+                '<h3>Confirm which driver is you</h3>' +
+                '<p><strong>' + escapeHtml(meta.track_venue || '') + '</strong>' +
+                    (meta.track_course && meta.track_course !== meta.track_venue ? ' <span style="opacity:0.6;">(' + escapeHtml(meta.track_course) + ')</span>' : '') +
+                    (meta.session_date ? ' • ' + escapeHtml(meta.session_date) : '') +
+                    (meta.fuel_mult && meta.fuel_mult != 1 ? ' • <span class="apex-fuel-mult-badge-small">' + meta.fuel_mult + 'x</span>' : '') +
+                '</p>' +
+                '<p class="apex-fuel-picker-hint">' + data.candidate_count + ' drivers in this XML. ' +
+                (preselected
+                    ? 'Pre-selected <strong>' + escapeHtml(preselected) + '</strong>' + (saved ? ' (matched your saved name)' : '') + ' — change if this isn’t you.'
+                    : (saved
+                        ? 'Your saved name <em>' + escapeHtml(saved) + '</em> didn’t match any driver in this XML. Pick yourself manually.'
+                        : 'Click the driver that is you.')) +
+                '</p>' +
+            '</div>' +
+            '<div class="apex-fuel-picker-list">';
+
+        (data.candidates || []).forEach(function(c) {
+            var selected = (c.name === preselected);
+            html += '<label class="apex-fuel-picker-card' + (selected ? ' selected' : '') + '">' +
+                '<input type="radio" name="apex-fuel-picker-driver" value="' + escapeHtml(c.name) + '"' + (selected ? ' checked' : '') + '>' +
+                '<div class="apex-fuel-picker-card-body">' +
+                    '<div class="apex-fuel-picker-name">' + escapeHtml(c.name) +
+                        (c.is_player ? ' <span class="apex-fuel-picker-tag">isPlayer</span>' : '') +
+                    '</div>' +
+                    '<div class="apex-fuel-picker-car">' + escapeHtml(c.car || '') +
+                        ' <span class="apex-fuel-picker-class">(' + escapeHtml(c.class || c.class_raw || '') + ')</span>' +
+                    '</div>' +
+                    '<div class="apex-fuel-picker-meta">' +
+                        (c.grid !== null && c.finish !== null ? 'Grid P' + c.grid + ' → Finish P' + c.finish + ' • ' : '') +
+                        (c.total_laps ? c.total_laps + ' laps' : '') +
+                        (c.pitstops !== null ? ' • ' + c.pitstops + ' pits' : '') +
+                        (c.finish_status ? ' • ' + escapeHtml(c.finish_status) : '') +
+                    '</div>' +
+                '</div>' +
+            '</label>';
+        });
+        html += '</div>';
+
+        html +=
+            '<div class="apex-fuel-picker-options">' +
+                '<label class="apex-checkbox-label">' +
+                    '<input type="checkbox" id="apex-fuel-picker-share" checked>' +
+                    '<span class="apex-checkbox-custom"></span>' +
+                    'Share my session anonymously to improve community averages' +
+                '</label>' +
+                '<label class="apex-checkbox-label">' +
+                    '<input type="checkbox" id="apex-fuel-picker-ghosts" checked>' +
+                    '<span class="apex-checkbox-custom"></span>' +
+                    'Also save the other ' + Math.max(0, data.candidate_count - 1) + ' drivers’ data anonymously (no names stored)' +
+                '</label>' +
+                '<label class="apex-checkbox-label">' +
+                    '<input type="checkbox" id="apex-fuel-picker-remember" checked>' +
+                    '<span class="apex-checkbox-custom"></span>' +
+                    'Remember this driver name (' + (saved ? 'currently: ' + escapeHtml(saved) : 'not set yet') + ')' +
+                '</label>' +
+            '</div>' +
+            '<div class="apex-fuel-picker-actions">' +
+                '<button class="apex-btn apex-btn-ghost" id="apex-fuel-picker-cancel">Cancel</button>' +
+                '<button class="apex-btn apex-btn-primary" id="apex-fuel-picker-save">Save Session</button>' +
+            '</div>';
+
+        $picker.data('upload-key', data.upload_key);
+        $picker.data('dropzone-original', dropzoneOriginal);
+        $picker.html(html);
+    }
+
+    // Visually mark the selected radio card
+    $(document).on('change', 'input[name="apex-fuel-picker-driver"]', function() {
+        $(this).closest('.apex-fuel-picker-list').find('.apex-fuel-picker-card').removeClass('selected');
+        $(this).closest('.apex-fuel-picker-card').addClass('selected');
+    });
+
+    $(document).on('click', '#apex-fuel-picker-cancel', function() {
+        var $picker = $('#apex-fuel-picker');
+        var dz = $picker.data('dropzone-original');
+        $picker.hide().empty();
+        if (dz) $('#apex-fuel-dropzone').html(dz).show();
+        $('#apex-fuel-share-option').show();
+    });
+
+    $(document).on('click', '#apex-fuel-picker-save', function() {
+        var $picker = $('#apex-fuel-picker');
+        var chosen = $picker.find('input[name="apex-fuel-picker-driver"]:checked').val();
+        if (!chosen) {
+            showNotification('Select which driver is you first.', 'error');
+            return;
+        }
+        var $btn = $(this);
+        $btn.prop('disabled', true).text('Saving…');
+
+        $.ajax({
+            url: apexNotesData.ajaxUrl,
+            type: 'POST',
+            data: {
+                action: 'apex_notes_confirm_fuel_upload',
+                nonce: apexNotesData.nonce,
+                upload_key: $picker.data('upload-key'),
+                driver_name: chosen,
+                share_with_community: $('#apex-fuel-picker-share').is(':checked') ? '1' : '0',
+                import_other_drivers: $('#apex-fuel-picker-ghosts').is(':checked') ? '1' : '0',
+                save_as_my_driver: $('#apex-fuel-picker-remember').is(':checked') ? '1' : '0'
+            },
+            success: function(response) {
+                $btn.prop('disabled', false).text('Save Session');
+                if (response.success) {
+                    $picker.hide().empty();
+                    displayFuelResult(response.data);
+                    var msg = 'Saved for ' + response.data.player_name + ' — ' + response.data.car;
+                    if (response.data.ghost_sessions_imported) {
+                        msg += ' (+' + response.data.ghost_sessions_imported + ' anonymous sessions for community)';
+                    }
+                    showNotification(msg, 'success');
+                } else {
+                    showNotification(response.data.message || 'Save failed', 'error');
+                }
+            },
+            error: function() {
+                $btn.prop('disabled', false).text('Save Session');
+                showNotification('Network error — try again.', 'error');
+            }
+        });
+    });
     
     // Display Fuel Result
     function displayFuelResult(data) {

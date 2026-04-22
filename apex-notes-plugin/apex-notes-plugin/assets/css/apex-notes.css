@@ -9147,6 +9147,113 @@ h2.apex-section-title .apex-results-count {
 }
 
 /* =====================================================
+   DRIVER PICKER (post-upload)
+   ===================================================== */
+.apex-fuel-picker {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(245,130,32,0.35);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+.apex-fuel-picker-header h3 {
+    margin: 0 0 0.25rem 0;
+    color: #F58220;
+}
+.apex-fuel-picker-header p {
+    margin: 0 0 0.25rem 0;
+    color: rgba(255,255,255,0.8);
+    font-size: 0.9rem;
+}
+.apex-fuel-picker-hint {
+    color: rgba(255,255,255,0.65) !important;
+    font-size: 0.85rem !important;
+    margin-bottom: 0.75rem !important;
+}
+.apex-fuel-picker-list {
+    max-height: 420px;
+    overflow-y: auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.5rem;
+    margin: 0.5rem 0 1rem 0;
+    padding-right: 0.25rem;
+}
+.apex-fuel-picker-card {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+.apex-fuel-picker-card:hover {
+    border-color: rgba(245,130,32,0.5);
+    background: rgba(245,130,32,0.06);
+}
+.apex-fuel-picker-card.selected {
+    border-color: #F58220;
+    background: rgba(245,130,32,0.12);
+}
+.apex-fuel-picker-card input[type="radio"] {
+    margin-top: 0.2rem;
+    flex-shrink: 0;
+    accent-color: #F58220;
+}
+.apex-fuel-picker-card-body { flex: 1; min-width: 0; }
+.apex-fuel-picker-name {
+    color: #fff;
+    font-weight: 600;
+    font-size: 0.95rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.apex-fuel-picker-tag {
+    display: inline-block;
+    font-size: 0.65rem;
+    padding: 0.05rem 0.35rem;
+    border-radius: 3px;
+    background: rgba(0,200,140,0.18);
+    color: #00d4aa;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    vertical-align: middle;
+    margin-left: 0.3rem;
+}
+.apex-fuel-picker-car {
+    color: rgba(255,255,255,0.85);
+    font-size: 0.85rem;
+    margin-top: 0.1rem;
+}
+.apex-fuel-picker-class {
+    color: rgba(255,255,255,0.55);
+    font-size: 0.8rem;
+}
+.apex-fuel-picker-meta {
+    color: rgba(255,255,255,0.5);
+    font-size: 0.75rem;
+    margin-top: 0.25rem;
+}
+.apex-fuel-picker-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.75rem;
+    background: rgba(0,0,0,0.2);
+    border-radius: 6px;
+    margin-bottom: 0.75rem;
+}
+.apex-fuel-picker-actions {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+}
+
+/* =====================================================
    PIT STRATEGY CALCULATOR + FUEL AI CHAT
    ===================================================== */
 

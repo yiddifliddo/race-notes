@@ -83,6 +83,14 @@ Users can upload their LMU session XML files (found in Documents\My Games\Le Man
 
 == Changelog ==
 
+= 1.19.1 =
+* CRITICAL FIX: In LMU multiplayer XMLs every driver is flagged isPlayer=1 — the previous logic silently picked whichever driver appeared first, which was almost never the uploader. This caused wrong car/class/stats to be saved.
+* NEW: Driver picker — after upload the plugin shows every driver in the XML (name, car, class, grid→finish, laps, pitstops) and requires you to confirm which one is you before saving anything. Nothing hits the database until you click Save.
+* NEW: The plugin remembers your LMU driver name (per WP user) and auto-preselects it on future uploads. Uncheck the "remember" box to disable.
+* NEW: Opt-in (default on) anonymous import of the other drivers' data from the same XML as ghost sessions (user_id=0, no names stored). Feeds community fuel averages without attributing to any user's profile.
+* Fix: Reverted an over-aggressive container traversal in find_player_driver that could match drivers from unrelated nested sessions.
+* Fix: Driver-name element is &lt;Name&gt; in LMU XMLs; the parser was reading &lt;n&gt;. Player names now populate correctly in the UI.
+
 = 1.19.0 =
 * NEW: Pit-Stop Calculator — work out optimal pit laps from your uploaded session data, supporting both lap-count and time-based races. Plans stints, fuel loads per stint, and suggests an even-split pit schedule to minimise fuel carried.
 * NEW: ApexFuelBot AI chat (Anthropic Claude) — ask questions about your fuel data, stint strategy, and pace. Uses your recent uploaded sessions plus community medians as context. Rate-limited to 30 questions/day per user.

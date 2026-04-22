@@ -3,7 +3,7 @@
  * Plugin Name: Apex Notes - Le Mans Ultimate Track Notes
  * Plugin URI: https://apexnotes.racing
  * Description: A community-driven platform for sharing detailed racing track notes, braking zones, and racing lines for Le Mans Ultimate sim racing.
- * Version: 1.19.0
+ * Version: 1.19.1
  * Author: Apex Notes Team
  * Author URI: https://apexnotes.racing
  * License: GPL v2 or later
@@ -35,7 +35,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('APEX_NOTES_VERSION', '1.19.0');
+define('APEX_NOTES_VERSION', '1.19.1');
 define('APEX_NOTES_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('APEX_NOTES_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('APEX_NOTES_PLUGIN_BASENAME', plugin_basename(__FILE__));

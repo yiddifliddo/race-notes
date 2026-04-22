@@ -4075,21 +4075,33 @@
 
         (data.candidates || []).forEach(function(c) {
             var selected = (c.name === preselected);
+            var tags = '';
+            if (c.is_co_driver) tags += ' <span class="apex-fuel-picker-tag cd">Co-driver</span>';
+            else if (c.is_primary) tags += ' <span class="apex-fuel-picker-tag pri">Lead</span>';
+            if (c.is_player) tags += ' <span class="apex-fuel-picker-tag">isPlayer</span>';
+
+            var stintInfo = '';
+            if (c.stints && c.stints.length) {
+                var ranges = c.stints.map(function(s){ return 'L' + s.start + '–' + s.end; }).join(', ');
+                stintInfo = c.stint_count + (c.stint_count === 1 ? ' stint' : ' stints') +
+                            ' (' + ranges + ')';
+            }
+
             html += '<label class="apex-fuel-picker-card' + (selected ? ' selected' : '') + '">' +
                 '<input type="radio" name="apex-fuel-picker-driver" value="' + escapeHtml(c.name) + '"' + (selected ? ' checked' : '') + '>' +
                 '<div class="apex-fuel-picker-card-body">' +
-                    '<div class="apex-fuel-picker-name">' + escapeHtml(c.name) +
-                        (c.is_player ? ' <span class="apex-fuel-picker-tag">isPlayer</span>' : '') +
-                    '</div>' +
+                    '<div class="apex-fuel-picker-name">' + escapeHtml(c.name) + tags + '</div>' +
                     '<div class="apex-fuel-picker-car">' + escapeHtml(c.car || '') +
                         ' <span class="apex-fuel-picker-class">(' + escapeHtml(c.class || c.class_raw || '') + ')</span>' +
+                        (c.team ? ' • <span class="apex-fuel-picker-class">' + escapeHtml(c.team) + '</span>' : '') +
                     '</div>' +
                     '<div class="apex-fuel-picker-meta">' +
-                        (c.grid !== null && c.finish !== null ? 'Grid P' + c.grid + ' → Finish P' + c.finish + ' • ' : '') +
-                        (c.total_laps ? c.total_laps + ' laps' : '') +
-                        (c.pitstops !== null ? ' • ' + c.pitstops + ' pits' : '') +
+                        (c.grid !== null && c.finish !== null ? 'Car: P' + c.grid + ' → P' + c.finish + ' • ' : '') +
+                        (c.driven_laps ? '<strong>' + c.driven_laps + ' laps driven</strong>' : '') +
+                        (c.car_total_laps && c.driven_laps !== c.car_total_laps ? ' of ' + c.car_total_laps : '') +
                         (c.finish_status ? ' • ' + escapeHtml(c.finish_status) : '') +
                     '</div>' +
+                    (stintInfo ? '<div class="apex-fuel-picker-stints">' + stintInfo + '</div>' : '') +
                 '</div>' +
             '</label>';
         });

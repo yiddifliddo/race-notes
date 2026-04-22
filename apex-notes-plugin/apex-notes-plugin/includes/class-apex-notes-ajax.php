@@ -2278,9 +2278,12 @@ CRITICAL RULES:
             }
         }
 
-        // Single community-average refresh per (track, car) pair touched
+        // Single community-average refresh per (track, car) pair touched —
+        // both fuel AND tire averages so the Tire Data page reflects newly
+        // uploaded XML data (tire_wear_* is extracted into fuel_laps).
         foreach ($community_refresh as $tc) {
             Apex_Notes_DB::update_community_average($tc['track'], $tc['car']);
+            Apex_Notes_DB::update_tire_average($tc['track'], $tc['car']);
         }
 
         // Clear the transient — upload consumed

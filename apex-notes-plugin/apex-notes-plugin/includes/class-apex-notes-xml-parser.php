@@ -83,8 +83,10 @@ class Apex_Notes_XML_Parser {
         $session_data['grid_position'] = isset($driver->GridPos) ? intval($driver->GridPos) : null;
         $session_data['finish_position'] = isset($driver->Position) ? intval($driver->Position) : null;
 
-        // Extract lap data
-        $laps = self::extract_lap_data($player_data['driver'], $session_data['car_type']);
+        // If this driver's laps need filtering to specific stints (co-driver
+        // case in a driver-swap endurance race), pass the ranges through.
+        $lap_ranges = isset($player_data['lap_ranges']) ? $player_data['lap_ranges'] : null;
+        $laps = self::extract_lap_data($player_data['driver'], $session_data['car_type'], $lap_ranges);
 
         // Calculate session statistics
         $stats = self::calculate_statistics($laps, $session_data['car_type']);
@@ -92,21 +94,38 @@ class Apex_Notes_XML_Parser {
         // Merge stats into session data
         $session_data = array_merge($session_data, $stats);
 
+        // When the caller specified a driver name, return THAT as the player
+        // (so co-driver picks don't show the primary <Name> in the UI).
+        $returned_name = ($driver_name !== null && $driver_name !== '')
+            ? $driver_name
+            : (string) $player_data['driver']->Name;
+
         return array(
             'session' => $session_data,
             'laps' => $laps,
-            'player_name' => (string) $player_data['driver']->Name,
+            'player_name' => $returned_name,
             'session_type_name' => $player_data['session_type']
         );
     }
 
     /**
-     * List every driver in the XML along with summary info, so the user
-     * can pick which one is them (especially for multiplayer XMLs where
-     * LMU flags every driver as isPlayer=1).
+     * List every *human* who drove in the XML, so the user can pick themselves.
      *
-     * @param string $xml_content
-     * @return array|WP_Error List of { name, car, class, laps, pits, grid, finish, is_player, has_laps, session_type }
+     * Critical: in LMU endurance events with driver swaps, each <Driver> block
+     * represents a CAR. The <Name> element is the car's lead/registered driver,
+     * but the people who actually drove each stint are listed inside <Swap
+     * startLap=".." endLap="..">Full Name</Swap> children. Listing only <Name>
+     * drivers would hide every co-driver — which is why the uploader could see
+     * their teammate but not themselves.
+     *
+     * This function walks every <Driver> block and extracts:
+     *   - the primary <Name>, with stints = [1..total_laps] when no <Swap>
+     *     children exist, else with the union of all <Swap> ranges attributed
+     *     to that same name.
+     *   - every unique co-driver listed in <Swap> children, with the union of
+     *     their stint ranges.
+     *
+     * @return array|WP_Error List of candidate dicts (see in-code for shape)
      */
     public static function list_candidates($xml_content) {
         libxml_use_internal_errors(true);
@@ -116,10 +135,9 @@ class Apex_Notes_XML_Parser {
             return new WP_Error('invalid_format', 'Not a valid LMU/rFactor results file');
         }
         $results = $xml->RaceResults;
-
         $session_names = self::ordered_session_names($results);
         $out = array();
-        $seen_names = array();
+        $seen = array();
 
         foreach ($session_names as $session_type) {
             $session = $results->$session_type;
@@ -127,38 +145,99 @@ class Apex_Notes_XML_Parser {
                 continue;
             }
             foreach ($session->Driver as $driver) {
-                $name = trim((string) $driver->Name);
-                if ($name === '') {
-                    continue;
+                $primary_name = trim((string) $driver->Name);
+                $total_laps = isset($driver->Laps) ? intval($driver->Laps) : 0;
+
+                // Build per-human stint list for this car
+                $per_name = array(); // name => array of ['start' => X, 'end' => Y]
+                $swap_count = isset($driver->Swap) ? count($driver->Swap) : 0;
+
+                if ($swap_count > 0) {
+                    foreach ($driver->Swap as $swap) {
+                        $n = trim((string) $swap);
+                        if ($n === '') continue;
+                        $attrs = $swap->attributes();
+                        $start = isset($attrs['startLap']) ? intval($attrs['startLap']) : 0;
+                        $end   = isset($attrs['endLap'])   ? intval($attrs['endLap'])   : 0;
+                        if ($start <= 0 || $end < $start) continue;
+                        if (!isset($per_name[$n])) $per_name[$n] = array();
+                        $per_name[$n][] = array('start' => $start, 'end' => $end);
+                    }
+                } else if ($primary_name !== '') {
+                    // No <Swap> children — primary drove the whole car
+                    $per_name[$primary_name] = array(
+                        array('start' => 1, 'end' => $total_laps ?: 9999)
+                    );
                 }
-                // Only list each driver once across sessions (prefer Race info)
-                $key = strtolower($name);
-                if (isset($seen_names[$key])) {
-                    continue;
+
+                // Emit one candidate per unique human in this car.
+                // A human who raced in two different cars (rare: team swap
+                // across multiple Driver blocks) will get de-duplicated to the
+                // first occurrence — race picks take precedence over practice.
+                foreach ($per_name as $name => $stints) {
+                    $key = strtolower($name);
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $driven = 0;
+                    foreach ($stints as $s) {
+                        $driven += ($s['end'] - $s['start'] + 1);
+                    }
+
+                    $out[] = array(
+                        'name' => $name,
+                        'car' => (string) $driver->CarType,
+                        'class_raw' => (string) $driver->CarClass,
+                        'class' => self::normalize_car_class((string) $driver->CarClass),
+                        'car_number' => isset($driver->CarNumber) ? (string) $driver->CarNumber : '',
+                        'team' => isset($driver->TeamName) ? (string) $driver->TeamName : '',
+                        'veh_name' => isset($driver->VehName) ? (string) $driver->VehName : '',
+                        'is_player' => ((string) $driver->isPlayer === '1'),
+                        'is_primary' => ($name === $primary_name),
+                        'is_co_driver' => ($swap_count > 0 && $name !== $primary_name),
+                        'primary_name' => $primary_name,
+                        'has_laps' => self::driver_has_laps($driver),
+                        'grid' => isset($driver->GridPos) ? intval($driver->GridPos) : null,
+                        'finish' => isset($driver->Position) ? intval($driver->Position) : null,
+                        'car_total_laps' => $total_laps,
+                        'driven_laps' => $driven,
+                        'stints' => $stints,
+                        'stint_count' => count($stints),
+                        'pitstops' => isset($driver->Pitstops) ? intval($driver->Pitstops) : null,
+                        'finish_status' => isset($driver->FinishStatus) ? (string) $driver->FinishStatus : '',
+                        'best_lap_time' => isset($driver->BestLapTime) ? floatval($driver->BestLapTime) : null,
+                        'session_type' => $session_type,
+                    );
                 }
-                $seen_names[$key] = true;
-                $out[] = array(
-                    'name' => $name,
-                    'car' => (string) $driver->CarType,
-                    'class_raw' => (string) $driver->CarClass,
-                    'class' => self::normalize_car_class((string) $driver->CarClass),
-                    'car_number' => isset($driver->CarNumber) ? (string) $driver->CarNumber : '',
-                    'team' => isset($driver->TeamName) ? (string) $driver->TeamName : '',
-                    'veh_name' => isset($driver->VehName) ? (string) $driver->VehName : '',
-                    'is_player' => ((string) $driver->isPlayer === '1'),
-                    'has_laps' => self::driver_has_laps($driver),
-                    'grid' => isset($driver->GridPos) ? intval($driver->GridPos) : null,
-                    'finish' => isset($driver->Position) ? intval($driver->Position) : null,
-                    'total_laps' => isset($driver->Laps) ? intval($driver->Laps) : null,
-                    'pitstops' => isset($driver->Pitstops) ? intval($driver->Pitstops) : null,
-                    'finish_status' => isset($driver->FinishStatus) ? (string) $driver->FinishStatus : '',
-                    'best_lap_time' => isset($driver->BestLapTime) ? floatval($driver->BestLapTime) : null,
-                    'session_type' => $session_type,
-                );
             }
         }
 
         return $out;
+    }
+
+    /**
+     * Return the list of stint lap ranges that a given driver name drove
+     * within a <Driver> block, or null if the name should use all laps.
+     */
+    private static function stint_ranges_for_name($driver, $preferred_name) {
+        if (!isset($driver->Swap) || count($driver->Swap) === 0) {
+            // No swaps — primary drove everything; no filtering needed.
+            return null;
+        }
+        $needle = strtolower(trim($preferred_name));
+        $ranges = array();
+        foreach ($driver->Swap as $swap) {
+            $n = strtolower(trim((string) $swap));
+            if ($n !== $needle) continue;
+            $attrs = $swap->attributes();
+            $start = isset($attrs['startLap']) ? intval($attrs['startLap']) : 0;
+            $end   = isset($attrs['endLap'])   ? intval($attrs['endLap'])   : 0;
+            if ($start > 0 && $end >= $start) {
+                $ranges[] = array('start' => $start, 'end' => $end);
+            }
+        }
+        // No matching swap => caller should move on; return empty array.
+        return $ranges;
     }
 
     /**
@@ -211,21 +290,49 @@ class Apex_Notes_XML_Parser {
     private static function find_player_driver($results, $preferred_name = null) {
         $session_names = self::ordered_session_names($results);
 
-        // Case 1: caller specified a driver name — exact match wins
+        // Case 1: caller specified a driver name — match against <Name> OR
+        // any <Swap> inside a <Driver>. When the match is a Swap, we also
+        // return the stint ranges so only that co-driver's laps are saved.
         if ($preferred_name !== null && $preferred_name !== '') {
             $needle = strtolower(trim($preferred_name));
+
+            // Pass A: <Name> match — use all laps
             foreach ($session_names as $session_type) {
                 $session = $results->$session_type;
-                if (!isset($session->Driver)) {
-                    continue;
-                }
+                if (!isset($session->Driver)) continue;
                 foreach ($session->Driver as $driver) {
                     $n = strtolower(trim((string) $driver->Name));
                     if ($n === $needle && self::driver_has_laps($driver)) {
-                        return array('driver' => $driver, 'session_type' => $session_type);
+                        // If this driver ALSO has Swap entries matching this
+                        // name, filter to just those stints. Some XMLs repeat
+                        // the primary driver as a Swap entry for their stints.
+                        $ranges = self::stint_ranges_for_name($driver, $preferred_name);
+                        return array(
+                            'driver' => $driver,
+                            'session_type' => $session_type,
+                            'lap_ranges' => (is_array($ranges) && count($ranges) > 0) ? $ranges : null,
+                        );
                     }
                 }
             }
+
+            // Pass B: <Swap> match — co-driver; filter laps to their stints
+            foreach ($session_names as $session_type) {
+                $session = $results->$session_type;
+                if (!isset($session->Driver)) continue;
+                foreach ($session->Driver as $driver) {
+                    if (!isset($driver->Swap) || count($driver->Swap) === 0) continue;
+                    $ranges = self::stint_ranges_for_name($driver, $preferred_name);
+                    if (is_array($ranges) && count($ranges) > 0 && self::driver_has_laps($driver)) {
+                        return array(
+                            'driver' => $driver,
+                            'session_type' => $session_type,
+                            'lap_ranges' => $ranges,
+                        );
+                    }
+                }
+            }
+
             return new WP_Error('driver_not_found', 'Driver "' . $preferred_name . '" not found in this XML.');
         }
 
@@ -241,9 +348,17 @@ class Apex_Notes_XML_Parser {
                 if (!self::driver_has_laps($driver)) {
                     continue;
                 }
-                $all_drivers_with_laps[] = array('driver' => $driver, 'session_type' => $session_type);
+                $all_drivers_with_laps[] = array(
+                    'driver' => $driver,
+                    'session_type' => $session_type,
+                    'lap_ranges' => null,
+                );
                 if ((string) $driver->isPlayer === '1') {
-                    $player_drivers[] = array('driver' => $driver, 'session_type' => $session_type);
+                    $player_drivers[] = array(
+                        'driver' => $driver,
+                        'session_type' => $session_type,
+                        'lap_ranges' => null,
+                    );
                 }
             }
         }
@@ -328,12 +443,19 @@ class Apex_Notes_XML_Parser {
     /**
      * Extract lap data from driver element.
      *
+     * @param SimpleXMLElement $driver
+     * @param string $car_type
+     * @param array|null $lap_ranges When non-null, a list of [{start,end}]
+     *   stint ranges. Only laps whose num attribute falls inside any range
+     *   are returned — used for co-driver attribution in endurance XMLs.
+     *
      * Post-processes laps to flag the out-lap (lap immediately after a pit
      * stop). Out-laps begin with cold tyres and incomplete fuel stint data,
      * so their per-lap fuel/VE usage is unreliable.
      */
-    private static function extract_lap_data($driver, $car_type) {
+    private static function extract_lap_data($driver, $car_type, $lap_ranges = null) {
         $laps = array();
+        $ranges_active = is_array($lap_ranges) && count($lap_ranges) > 0;
 
         foreach ($driver->children() as $child) {
             if ($child->getName() !== 'Lap') {
@@ -341,9 +463,20 @@ class Apex_Notes_XML_Parser {
             }
 
             $lap = self::parse_lap_element($child, $car_type);
-            if ($lap) {
-                $laps[] = $lap;
+            if (!$lap) continue;
+
+            if ($ranges_active) {
+                $in_range = false;
+                foreach ($lap_ranges as $r) {
+                    if ($lap['lap_num'] >= $r['start'] && $lap['lap_num'] <= $r['end']) {
+                        $in_range = true;
+                        break;
+                    }
+                }
+                if (!$in_range) continue;
             }
+
+            $laps[] = $lap;
         }
 
         // Second pass: mark out-laps (the lap after any pit in-lap) as invalid

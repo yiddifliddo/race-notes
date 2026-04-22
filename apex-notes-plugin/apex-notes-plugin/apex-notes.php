@@ -3,7 +3,7 @@
  * Plugin Name: Apex Notes - Le Mans Ultimate Track Notes
  * Plugin URI: https://apexnotes.racing
  * Description: A community-driven platform for sharing detailed racing track notes, braking zones, and racing lines for Le Mans Ultimate sim racing.
- * Version: 1.19.1
+ * Version: 1.19.2
  * Author: Apex Notes Team
  * Author URI: https://apexnotes.racing
  * License: GPL v2 or later
@@ -35,7 +35,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Plugin constants
-define('APEX_NOTES_VERSION', '1.19.1');
+define('APEX_NOTES_VERSION', '1.19.2');
 define('APEX_NOTES_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('APEX_NOTES_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('APEX_NOTES_PLUGIN_BASENAME', plugin_basename(__FILE__));
@@ -165,6 +165,12 @@ class Apex_Notes {
             // use median + IQR trimming. Rebuild from shared sessions once.
             if (version_compare($stored_version, '1.19.0', '<')) {
                 Apex_Notes_DB::recalculate_all_community_averages();
+            }
+
+            // v1.19.2: tire averages now refresh on upload; backfill once for
+            // existing fuel sessions so the Tire Data page reflects them.
+            if (version_compare($stored_version, '1.19.2', '<')) {
+                Apex_Notes_DB::recalculate_all_tire_averages();
             }
 
             update_option('apex_notes_version', APEX_NOTES_VERSION);

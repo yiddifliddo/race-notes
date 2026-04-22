@@ -83,6 +83,12 @@ Users can upload their LMU session XML files (found in Documents\My Games\Le Man
 
 == Changelog ==
 
+= 1.19.2 =
+* CRITICAL FIX: Driver picker now lists co-drivers from team/endurance events. LMU stores each stint's driver inside &lt;Swap startLap=".." endLap=".."&gt; elements within a car's &lt;Driver&gt; block — previously only the registered lead driver's &lt;Name&gt; was shown, so co-drivers uploading their own race couldn't find themselves in the picker.
+* Laps are filtered to the selected driver's stint ranges — only the laps they actually drove are saved as their session. Primary drivers with &lt;Swap&gt; entries matching their own name are filtered the same way.
+* Picker cards now show Lead / Co-driver tags, "X laps driven" of Y, team name, and the specific stint lap ranges.
+* FIX: Tire averages now refresh on every fuel XML upload instead of being stuck on whatever was first computed (or never written). Tire Data page reflects newly contributed XMLs immediately. Migration back-fills on upgrade.
+
 = 1.19.1 =
 * CRITICAL FIX: In LMU multiplayer XMLs every driver is flagged isPlayer=1 — the previous logic silently picked whichever driver appeared first, which was almost never the uploader. This caused wrong car/class/stats to be saved.
 * NEW: Driver picker — after upload the plugin shows every driver in the XML (name, car, class, grid→finish, laps, pitstops) and requires you to confirm which one is you before saving anything. Nothing hits the database until you click Save.

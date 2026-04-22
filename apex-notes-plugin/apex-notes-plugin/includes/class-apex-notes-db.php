@@ -2103,6 +2103,101 @@ class Apex_Notes_DB {
     }
     
     /**
+     * Recompute and persist tire averages for a (track, car) pair from
+     * shared fuel_laps rows. Uses consecutive lap deltas on each corner
+     * (prev.wear - curr.wear) to derive per-lap wear.
+     *
+     * Called after fuel uploads so the Tire Data page reflects newly
+     * contributed XML data instead of stale / never-written averages.
+     */
+    public static function update_tire_average($track_venue, $car_type) {
+        global $wpdb;
+        $sessions_table = $wpdb->prefix . 'apex_notes_fuel_sessions';
+        $laps_table = $wpdb->prefix . 'apex_notes_fuel_laps';
+        $averages_table = $wpdb->prefix . 'apex_notes_tire_averages';
+
+        $session_ids = $wpdb->get_col($wpdb->prepare(
+            "SELECT id FROM $sessions_table
+             WHERE track_venue = %s AND car_type = %s AND shared_with_community = 1",
+            $track_venue, $car_type
+        ));
+
+        // Wipe existing rows for this (track, car) — we rebuild from scratch.
+        $wpdb->query($wpdb->prepare(
+            "DELETE FROM $averages_table WHERE track_venue = %s AND car_type = %s",
+            $track_venue, $car_type
+        ));
+
+        if (empty($session_ids)) return false;
+
+        $placeholders = implode(',', array_fill(0, count($session_ids), '%d'));
+        $query = $wpdb->prepare(
+            "SELECT
+                COUNT(DISTINCT l.session_id) as sample_count,
+                COUNT(*) as lap_count,
+                AVG(CASE WHEN l.lap_num > 1 AND prev.tire_wear_fl IS NOT NULL
+                         AND prev.tire_wear_fl > l.tire_wear_fl
+                    THEN prev.tire_wear_fl - l.tire_wear_fl ELSE NULL END) as avg_wear_fl,
+                AVG(CASE WHEN l.lap_num > 1 AND prev.tire_wear_fr IS NOT NULL
+                         AND prev.tire_wear_fr > l.tire_wear_fr
+                    THEN prev.tire_wear_fr - l.tire_wear_fr ELSE NULL END) as avg_wear_fr,
+                AVG(CASE WHEN l.lap_num > 1 AND prev.tire_wear_rl IS NOT NULL
+                         AND prev.tire_wear_rl > l.tire_wear_rl
+                    THEN prev.tire_wear_rl - l.tire_wear_rl ELSE NULL END) as avg_wear_rl,
+                AVG(CASE WHEN l.lap_num > 1 AND prev.tire_wear_rr IS NOT NULL
+                         AND prev.tire_wear_rr > l.tire_wear_rr
+                    THEN prev.tire_wear_rr - l.tire_wear_rr ELSE NULL END) as avg_wear_rr,
+                MAX(s.car_class) as car_class
+             FROM $laps_table l
+             LEFT JOIN $laps_table prev
+                 ON l.session_id = prev.session_id AND l.lap_num = prev.lap_num + 1
+             JOIN $sessions_table s ON s.id = l.session_id
+             WHERE l.session_id IN ($placeholders)
+               AND l.is_valid = 1
+               AND l.is_pit_lap = 0
+               AND l.tire_wear_fl IS NOT NULL",
+            ...$session_ids
+        );
+        $r = $wpdb->get_row($query, ARRAY_A);
+
+        if (!$r || !$r['avg_wear_fl']) return false;
+
+        $wears = array(
+            'FL' => floatval($r['avg_wear_fl']),
+            'FR' => floatval($r['avg_wear_fr']),
+            'RL' => floatval($r['avg_wear_rl']),
+            'RR' => floatval($r['avg_wear_rr']),
+        );
+        arsort($wears);
+        $critical_tire = key($wears);
+        $critical_wear = current($wears);
+        $min_wear = min($wears);
+        $max_wear = max($wears);
+        // Usable 50% to "threshold" — caller can override. Default: 50% usable.
+        $estimated_life = $critical_wear > 0 ? (int) floor(0.5 / $critical_wear) : null;
+
+        $wpdb->insert($averages_table, array(
+            'track_venue' => $track_venue,
+            'car_type' => $car_type,
+            'car_class' => $r['car_class'] ?: '',
+            'tire_compound' => 'Medium',
+            'sample_count' => intval($r['sample_count']),
+            'lap_count' => intval($r['lap_count']),
+            'avg_wear_fl_per_lap' => $wears['FL'],
+            'avg_wear_fr_per_lap' => $wears['FR'],
+            'avg_wear_rl_per_lap' => $wears['RL'],
+            'avg_wear_rr_per_lap' => $wears['RR'],
+            'min_wear_per_lap' => $min_wear,
+            'max_wear_per_lap' => $max_wear,
+            'critical_tire' => $critical_tire,
+            'avg_critical_wear' => $critical_wear,
+            'estimated_tire_life' => $estimated_life,
+        ));
+
+        return true;
+    }
+
+    /**
      * Get community tire average for a track+car combination
      */
     public static function get_tire_average($track_venue, $car_type, $compound = null) {
@@ -2563,6 +2658,32 @@ class Apex_Notes_DB {
         ), ARRAY_A);
     }
     
+    /**
+     * Rebuild tire averages for every (track, car) pair that has shared
+     * fuel sessions. Run once on version upgrade; after that, tire
+     * averages refresh per-upload in confirm_fuel_upload.
+     */
+    public static function recalculate_all_tire_averages() {
+        global $wpdb;
+        $sessions_table = $wpdb->prefix . 'apex_notes_fuel_sessions';
+
+        $combos = $wpdb->get_results(
+            "SELECT DISTINCT track_venue, car_type
+             FROM $sessions_table
+             WHERE shared_with_community = 1",
+            ARRAY_A
+        );
+        if (!$combos) return 0;
+
+        $count = 0;
+        foreach ($combos as $combo) {
+            if (self::update_tire_average($combo['track_venue'], $combo['car_type'])) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
     /**
      * Recalculate all community averages from shared sessions
      * Called on plugin activation/update to ensure new fields are populated

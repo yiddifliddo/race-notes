@@ -9224,6 +9224,20 @@ h2.apex-section-title .apex-results-count {
     vertical-align: middle;
     margin-left: 0.3rem;
 }
+.apex-fuel-picker-tag.cd {
+    background: rgba(100, 150, 255, 0.18);
+    color: #8fb3ff;
+}
+.apex-fuel-picker-tag.pri {
+    background: rgba(245, 130, 32, 0.18);
+    color: #ffb37a;
+}
+.apex-fuel-picker-stints {
+    color: rgba(255,255,255,0.55);
+    font-size: 0.72rem;
+    margin-top: 0.2rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
 .apex-fuel-picker-car {
     color: rgba(255,255,255,0.85);
     font-size: 0.85rem;
